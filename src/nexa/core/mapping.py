@@ -1,79 +1,89 @@
-import cv2
+"""Face mapping — match source faces to target faces via cosine similarity."""
+
+from __future__ import annotations
+
 import numpy as np
-from typing import Optional
+from rich.console import Console
 
-from nexa.utils.logging import log_info
-
-DEFAULT_SIMILARITY_THRESHOLD = 0.6
+console = Console()
 
 
-def cosine_similarity(vec1: np.ndarray, vec2: np.ndarray) -> float:
-    """Cosine similarity safe against zero-norm vectors."""
-    norm1 = np.linalg.norm(vec1)
-    norm2 = np.linalg.norm(vec2)
-    if norm1 == 0.0 or norm2 == 0.0:
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors."""
+    a = a.flatten().astype(np.float64)
+    b = b.flatten().astype(np.float64)
+    dot = np.dot(a, b)
+    norm = np.linalg.norm(a) * np.linalg.norm(b)
+    if norm < 1e-12:
         return 0.0
-    return float(np.dot(vec1, vec2) / (norm1 * norm2))
+    return float(dot / norm)
 
 
 class FaceMapper:
-    """
-    Maps source faces to target faces using cosine similarity of embeddings.
+    """Map source identities to detected target faces.
 
-    mappings: list of (source_path, target_path | None).
-              If target_path is None, the source applies to ALL detected faces.
+    In *single-face* mode a single source embedding is matched against every
+    detected target face.  In *multi-face* mode each source is matched to its
+    closest target face above the similarity threshold.
     """
 
-    def __init__(self, analyzer, mappings: list, threshold: float = DEFAULT_SIMILARITY_THRESHOLD):
-        self.analyzer = analyzer
+    def __init__(self, threshold: float = 0.6) -> None:
         self.threshold = threshold
-        self.default_source_face = None
-        self.specific_mappings: list[dict] = []
+        # source_id → 512-d embedding
+        self._sources: dict[str, np.ndarray] = {}
 
-        self._build(mappings)
+    def add_source(self, name: str, embedding: np.ndarray) -> None:
+        """Register a source identity."""
+        self._sources[name] = embedding
 
-    def _build(self, mappings: list):
-        for src_path, tgt_path in mappings:
-            src_img = cv2.imread(str(src_path))
-            if src_img is None:
-                raise FileNotFoundError(f"Cannot read source image: {src_path}")
-            src_faces = self.analyzer.analyze(src_img)
-            if not src_faces:
-                raise ValueError(f"No face detected in source image: {src_path}")
-            src_face = src_faces[0]
+    @property
+    def source_count(self) -> int:
+        return len(self._sources)
 
-            if tgt_path is None:
-                self.default_source_face = src_face
-                log_info(f"Default source face loaded from {src_path}")
+    # ── Matching ──────────────────────────────────────────────────────────────
+
+    def match_single(
+        self,
+        source_embedding: np.ndarray,
+        target_faces: list,
+    ) -> list[tuple[int, float]]:
+        """Match a single source against all target faces.
+
+        Returns list of ``(face_index, similarity)`` for faces above threshold.
+        """
+        matches: list[tuple[int, float]] = []
+        for i, face in enumerate(target_faces):
+            sim = cosine_similarity(source_embedding, face.normed_embedding)
+            if sim >= self.threshold:
+                matches.append((i, sim))
             else:
-                tgt_img = cv2.imread(str(tgt_path))
-                if tgt_img is None:
-                    raise FileNotFoundError(f"Cannot read target reference image: {tgt_path}")
-                tgt_faces = self.analyzer.analyze(tgt_img)
-                if not tgt_faces:
-                    raise ValueError(f"No face detected in target reference image: {tgt_path}")
-                self.specific_mappings.append({
-                    "target_emb": tgt_faces[0].embedding,
-                    "source_face": src_face,
-                })
-                log_info(f"Mapped {src_path} -> {tgt_path}")
+                # In single-source mode, swap ALL faces regardless of similarity
+                matches.append((i, sim))
+        return matches
 
-    def get_source_for_target(self, target_face) -> Optional[object]:
+    def match_multi(
+        self,
+        target_faces: list,
+    ) -> dict[int, tuple[str, np.ndarray, float]]:
+        """Match multiple sources to target faces.
+
+        Returns ``{face_index: (source_name, source_embedding, similarity)}``.
+        Each target face is matched to the *best* source above threshold.
         """
-        Return the source Face that should replace *target_face*,
-        or None if nothing matches.
-        """
-        if not self.specific_mappings:
-            return self.default_source_face
-
-        best_sim = -1.0
-        best_src = None
-        target_emb = target_face.embedding
-
-        for m in self.specific_mappings:
-            sim = cosine_similarity(target_emb, m["target_emb"])
-            if sim > self.threshold and sim > best_sim:
-                best_sim = sim
-                best_src = m["source_face"]
-
-        return best_src if best_src is not None else self.default_source_face
+        result: dict[int, tuple[str, np.ndarray, float]] = {}
+        for i, face in enumerate(target_faces):
+            best_name: str | None = None
+            best_emb: np.ndarray | None = None
+            best_sim = -1.0
+            for name, src_emb in self._sources.items():
+                sim = cosine_similarity(src_emb, face.normed_embedding)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_name = name
+                    best_emb = src_emb
+            if best_name is not None and best_sim >= self.threshold:
+                result[i] = (best_name, best_emb, best_sim)
+                console.print(
+                    f"[dim]Face {i} → {best_name} (sim={best_sim:.3f})[/]"
+                )
+        return result

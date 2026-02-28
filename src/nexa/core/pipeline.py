@@ -1,142 +1,230 @@
-import cv2
-import imageio
-import shutil
+"""Pipeline — orchestrates image / video face-swap processing."""
+
+from __future__ import annotations
+
 import tempfile
 from pathlib import Path
-from typing import Optional
 
+import cv2
+import imageio.v3 as iio
+import numpy as np
+from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
 
-from nexa.models.analyzer import FaceAnalyzer
-from nexa.models.swapper import Swapper
-from nexa.models.enhancers import FaceEnhancer
+from nexa.core.audio import extract_audio, mux_audio
 from nexa.core.mapping import FaceMapper
-from nexa.core.audio import extract_audio, mux_audio_video
-from nexa.utils.video import is_video, get_frame_count
-from nexa.utils.logging import log_info, log_warn, log_success, log_error, check_ffmpeg
+from nexa.models.analyzer import FaceAnalyzer
+from nexa.models.swapper import FaceSwapper
+from nexa.models.enhancers import get_enhancer
+from nexa.utils.video import is_video, is_image, count_frames, get_fps
+
+console = Console()
 
 
-def process_media(
-    target_path: Path,
-    output_path: Path,
-    mappings: list,
-    model_id: str,
-    steps: int,
-    enhancer: Optional[str],
-    use_gpu: bool = False,
-    similarity_threshold: float = 0.6,
-):
-    """
-    Main entry point.  Detects whether *target_path* is a video or image
-    and delegates to the appropriate handler.  All video frames are
-    processed in-memory -- no intermediate frame files are created.
-    """
-    check_ffmpeg()
+class NexaPipeline:
+    """End-to-end face-swap pipeline for images and videos."""
 
-    log_info("Initialising models ...")
-    analyzer = FaceAnalyzer(use_gpu=use_gpu)
-    mapper = FaceMapper(analyzer, mappings, threshold=similarity_threshold)
-    swapper = Swapper(model_id=model_id, use_gpu=use_gpu, steps=steps)
+    def __init__(
+        self,
+        model_id: str = "runwayml/stable-diffusion-v1-5",
+        device: str = "cuda",
+        steps: int = 20,
+        enhancer_name: str | None = None,
+        threshold: float = 0.6,
+        ip_scale: float = 1.0,
+        strength: float = 0.65,
+        guidance_scale: float = 5.0,
+    ) -> None:
+        self.analyzer = FaceAnalyzer()
+        self.swapper = FaceSwapper(
+            model_id=model_id,
+            device=device,
+            steps=steps,
+            ip_scale=ip_scale,
+            strength=strength,
+            guidance_scale=guidance_scale,
+        )
+        self.enhancer = get_enhancer(enhancer_name)
+        self.mapper = FaceMapper(threshold=threshold)
 
-    face_enhancer = None
-    if enhancer:
-        log_info(f"Loading face enhancer: {enhancer}")
-        face_enhancer = FaceEnhancer(name=enhancer)
+    # ── Public API ────────────────────────────────────────────────────────────
 
-    if is_video(target_path):
-        _process_video(target_path, output_path, mapper, analyzer, swapper, face_enhancer)
-    else:
-        _process_image(target_path, output_path, mapper, analyzer, swapper, face_enhancer)
+    def process_image_single(
+        self,
+        source_path: str | Path,
+        target_path: str | Path,
+        output_path: str | Path,
+    ) -> Path:
+        """Single-source face swap on an image."""
+        source_img = cv2.imread(str(source_path))
+        target_img = cv2.imread(str(target_path))
 
+        if source_img is None:
+            raise FileNotFoundError(f"Cannot read source: {source_path}")
+        if target_img is None:
+            raise FileNotFoundError(f"Cannot read target: {target_path}")
 
-def _process_video(
-    target_path: Path,
-    output_path: Path,
-    mapper: FaceMapper,
-    analyzer: FaceAnalyzer,
-    swapper: Swapper,
-    enhancer: Optional[FaceEnhancer],
-):
-    log_info("Processing video in-memory (no frame extraction to disk) ...")
+        # Detect source face
+        src_faces = self.analyzer.detect(source_img)
+        if not src_faces:
+            raise RuntimeError(f"No face detected in source: {source_path}")
+        src_emb = self.analyzer.embedding(src_faces[0])
 
-    with tempfile.TemporaryDirectory() as tmp:
-        tmp_dir = Path(tmp)
-        tmp_audio = tmp_dir / "audio.m4a"
-        tmp_video = tmp_dir / "video.mp4"
+        # Detect target faces
+        tgt_faces = self.analyzer.detect(target_img)
+        if not tgt_faces:
+            console.print("[yellow]No faces detected in target — copying as-is.[/]")
+            cv2.imwrite(str(output_path), target_img)
+            return Path(output_path)
 
-        log_info("Extracting audio track ...")
-        has_audio = extract_audio(target_path, tmp_audio)
+        # Swap each target face
+        result = target_img.copy()
+        for face in tgt_faces:
+            result = self.swapper.swap_face_in_image(result, face, src_emb)
 
-        reader = imageio.get_reader(target_path)
-        fps = reader.get_meta_data()["fps"]
-        writer = imageio.get_writer(tmp_video, fps=fps, codec="libx264", format="FFMPEG")
+        # Enhance
+        if self.enhancer is not None:
+            result = self.enhancer.enhance(result)
 
-        total_frames = get_frame_count(target_path) or None
+        cv2.imwrite(str(output_path), result)
+        console.print(f"[bold green]Saved:[/] {output_path}")
+        return Path(output_path)
+
+    def process_image_multi(
+        self,
+        mappings: dict[str, str],
+        target_path: str | Path,
+        output_path: str | Path,
+    ) -> Path:
+        """Multi-source face swap on an image.
+
+        *mappings* is ``{source_path: reference_face_path}``.
+        """
+        target_img = cv2.imread(str(target_path))
+        if target_img is None:
+            raise FileNotFoundError(f"Cannot read target: {target_path}")
+
+        # Register sources
+        for src_path, ref_path in mappings.items():
+            src_img = cv2.imread(str(src_path))
+            ref_img = cv2.imread(str(ref_path))
+            if src_img is None:
+                raise FileNotFoundError(f"Cannot read source: {src_path}")
+            if ref_img is None:
+                raise FileNotFoundError(f"Cannot read reference: {ref_path}")
+
+            src_faces = self.analyzer.detect(src_img)
+            ref_faces = self.analyzer.detect(ref_img)
+            if not src_faces:
+                raise RuntimeError(f"No face in source: {src_path}")
+            if not ref_faces:
+                raise RuntimeError(f"No face in reference: {ref_path}")
+
+            self.mapper.add_source(str(src_path), self.analyzer.embedding(src_faces[0]))
+            # Also register the reference embedding for matching
+            self.mapper.add_source(
+                f"_ref_{ref_path}",
+                self.analyzer.embedding(ref_faces[0]),
+            )
+
+        # Detect target faces
+        tgt_faces = self.analyzer.detect(target_img)
+        if not tgt_faces:
+            console.print("[yellow]No faces in target.[/]")
+            cv2.imwrite(str(output_path), target_img)
+            return Path(output_path)
+
+        # Match and swap
+        result = target_img.copy()
+        match_map = self.mapper.match_multi(tgt_faces)
+        for face_idx, (src_name, src_emb, sim) in match_map.items():
+            result = self.swapper.swap_face_in_image(
+                result, tgt_faces[face_idx], src_emb
+            )
+
+        if self.enhancer is not None:
+            result = self.enhancer.enhance(result)
+
+        cv2.imwrite(str(output_path), result)
+        console.print(f"[bold green]Saved:[/] {output_path}")
+        return Path(output_path)
+
+    def process_video(
+        self,
+        source_path: str | Path,
+        target_path: str | Path,
+        output_path: str | Path,
+    ) -> Path:
+        """Single-source face swap on a video."""
+        source_img = cv2.imread(str(source_path))
+        if source_img is None:
+            raise FileNotFoundError(f"Cannot read source: {source_path}")
+
+        src_faces = self.analyzer.detect(source_img)
+        if not src_faces:
+            raise RuntimeError(f"No face in source: {source_path}")
+        src_emb = self.analyzer.embedding(src_faces[0])
+
+        target_path = Path(target_path)
+        output_path = Path(output_path)
+
+        # Get video metadata
+        fps = get_fps(target_path)
+        total = count_frames(target_path)
+        console.print(f"[dim]Video: {total} frames @ {fps:.1f} FPS[/]")
+
+        # Extract audio
+        tmp_dir = Path(tempfile.mkdtemp(prefix="nexa_"))
+        audio_file = tmp_dir / "audio.aac"
+        has_audio = extract_audio(target_path, audio_file)
+
+        # Process frames
+        tmp_video = tmp_dir / "video_noaudio.mp4"
+        writer = iio.imopen(str(tmp_video), "w", plugin="pyav")
+        writer.init_video_stream("libx264", fps=fps)
 
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("[cyan]{task.completed}/{task.total}[/cyan]" if total_frames else ""),
+            TextColumn("{task.completed}/{task.total}"),
             TimeElapsedColumn(),
+            console=console,
         ) as progress:
-            task = progress.add_task("Swapping faces", total=total_frames)
+            task = progress.add_task("Swapping faces", total=total)
 
-            for frame in reader:
+            for frame in iio.imiter(str(target_path), plugin="pyav"):
+                # frame is RGB numpy array
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                for face in analyzer.analyze(frame_bgr):
-                    src = mapper.get_source_for_target(face)
-                    if src:
-                        frame_bgr = swapper.swap(frame_bgr, src, face)
+                # Detect faces in this frame
+                faces = self.analyzer.detect(frame_bgr)
+                if faces:
+                    for face in faces:
+                        frame_bgr = self.swapper.swap_face_in_image(
+                            frame_bgr, face, src_emb
+                        )
 
-                if enhancer:
-                    frame_bgr = enhancer.enhance(frame_bgr)
+                    if self.enhancer is not None:
+                        frame_bgr = self.enhancer.enhance(frame_bgr)
 
-                writer.append_data(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+                # Convert back to RGB for writer
+                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                writer.write_frame(frame_rgb)
                 progress.advance(task)
 
         writer.close()
-        reader.close()
 
+        # Mux audio
         if has_audio:
-            log_info("Muxing audio back into output ...")
-            if not mux_audio_video(tmp_video, tmp_audio, output_path):
-                log_warn("Audio mux failed; saving video without audio.")
-                shutil.copy(tmp_video, output_path)
+            mux_audio(tmp_video, audio_file, output_path)
         else:
-            log_info("No audio track found in source; copying video.")
-            shutil.copy(tmp_video, output_path)
+            import shutil
+            shutil.copy2(tmp_video, output_path)
 
-    log_success(f"Video saved to {output_path}")
+        # Cleanup
+        import shutil as _shutil
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
-
-def _process_image(
-    target_path: Path,
-    output_path: Path,
-    mapper: FaceMapper,
-    analyzer: FaceAnalyzer,
-    swapper: Swapper,
-    enhancer: Optional[FaceEnhancer],
-):
-    log_info("Processing image ...")
-    img = cv2.imread(str(target_path))
-    if img is None:
-        raise FileNotFoundError(f"Cannot read target image: {target_path}")
-
-    faces = analyzer.analyze(img)
-    if not faces:
-        log_warn("No faces detected in target image. Saving original.")
-        cv2.imwrite(str(output_path), img)
-        return
-
-    for face in faces:
-        src = mapper.get_source_for_target(face)
-        if src:
-            img = swapper.swap(img, src, face)
-
-    if enhancer:
-        img = enhancer.enhance(img)
-
-    cv2.imwrite(str(output_path), img)
-    log_success(f"Image saved to {output_path}")
+        console.print(f"[bold green]Saved:[/] {output_path}")
+        return output_path

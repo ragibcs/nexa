@@ -1,66 +1,91 @@
+"""GFPGAN / CodeFormer post-processing face enhancement."""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
 import cv2
 import numpy as np
+from rich.console import Console
 
-from nexa.utils.logging import log_info, log_warn
+from nexa.models.manager import download_gfpgan, download_codeformer
 
-AVAILABLE_ENHANCERS = ["gfpgan", "codeformer"]
+console = Console()
 
 
-class FaceEnhancer:
-    """Wrapper around GFPGAN / CodeFormer for post-swap face restoration."""
+def _patch_torchvision() -> None:
+    """Monkeypatch for ``torchvision.transforms.functional_tensor`` removed
+    in torchvision >= 0.17.  GFPGAN still imports it internally."""
+    try:
+        import torchvision.transforms.functional_tensor  # noqa: F401
+    except (ImportError, ModuleNotFoundError):
+        import torchvision.transforms.functional as _functional
+        sys.modules["torchvision.transforms.functional_tensor"] = _functional
 
-    def __init__(self, name: str = "gfpgan"):
-        self.name = name.lower()
-        self._restorer = None
-        self._load()
 
-    def _load(self):
-        if self.name == "gfpgan":
-            self._load_gfpgan()
-        elif self.name == "codeformer":
-            self._load_codeformer()
-        else:
-            raise ValueError(
-                f"Unknown enhancer '{self.name}'. Available: {AVAILABLE_ENHANCERS}"
-            )
+class GFPGANEnhancer:
+    """Enhance faces using GFPGANv1.4."""
 
-    def _load_gfpgan(self):
-        # Workaround for older gfpgan expecting torchvision.transforms.functional_tensor
-        import sys
-        try:
-            import torchvision.transforms.functional as functional
-            sys.modules["torchvision.transforms.functional_tensor"] = functional
-        except ImportError:
-            pass
+    def __init__(self) -> None:
+        _patch_torchvision()
+        model_path = download_gfpgan()
+        console.print(f"[bold green]Loading GFPGAN[/] from {model_path}")
 
-        try:
-            from gfpgan import GFPGANer
-        except ImportError:
-            raise ImportError(
-                "gfpgan is not installed. Install it with: pip install gfpgan"
-            )
+        from gfpgan import GFPGANer
 
-        from nexa.models.manager import get_model_path
-
-        model_path = get_model_path("gfpgan_1.4")
-        self._restorer = GFPGANer(
+        self.enhancer = GFPGANer(
             model_path=str(model_path),
             upscale=1,
             arch="clean",
             channel_multiplier=2,
+            bg_upsampler=None,
         )
-        log_info("GFPGAN enhancer loaded.")
+        console.print("[green]GFPGAN ready.[/]")
 
-    def _load_codeformer(self):
-        log_warn("CodeFormer enhancer is not yet fully integrated; falling back to GFPGAN.")
-        self._load_gfpgan()
-
-    def enhance(self, img: np.ndarray) -> np.ndarray:
-        """Enhance / restore faces in a BGR uint8 image."""
-        if self._restorer is None:
-            return img
-
-        _, _, output = self._restorer.enhance(
-            img, has_aligned=False, only_center_face=False, paste_back=True
+    def enhance(self, image: np.ndarray) -> np.ndarray:
+        """Enhance all faces in *image* (BGR, uint8).  Returns enhanced BGR."""
+        _, _, output = self.enhancer.enhance(
+            image, has_aligned=False, only_center_face=False, paste_back=True
         )
         return output
+
+
+class CodeFormerEnhancer:
+    """Enhance faces using CodeFormer (placeholder — falls back to GFPGAN
+    if CodeFormer dependencies are not installed)."""
+
+    def __init__(self) -> None:
+        _patch_torchvision()
+        try:
+            # CodeFormer requires its own repo; fall back to GFPGAN if unavailable
+            from codeformer.facelib.utils.face_restoration_helper import FaceRestoreHelper  # noqa: F401
+            model_path = download_codeformer()
+            console.print(f"[bold green]Loading CodeFormer[/] from {model_path}")
+            # Full CodeFormer integration would go here
+            self._fallback = None
+        except ImportError:
+            console.print(
+                "[yellow]CodeFormer not available — falling back to GFPGAN.[/]"
+            )
+            self._fallback = GFPGANEnhancer()
+
+    def enhance(self, image: np.ndarray) -> np.ndarray:
+        if self._fallback is not None:
+            return self._fallback.enhance(image)
+        # CodeFormer processing would go here
+        return image
+
+
+def get_enhancer(name: str | None):
+    """Factory: return an enhancer instance or ``None``."""
+    if name is None:
+        return None
+    name = name.lower().strip()
+    if name == "gfpgan":
+        return GFPGANEnhancer()
+    elif name == "codeformer":
+        return CodeFormerEnhancer()
+    else:
+        console.print(f"[red]Unknown enhancer '{name}' — skipping.[/]")
+        return None

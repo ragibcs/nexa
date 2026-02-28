@@ -1,22 +1,37 @@
+"""Rich-based coloured logging + FFmpeg availability check."""
+
+from __future__ import annotations
+
 import shutil
+
 from rich.console import Console
+from rich.logging import RichHandler
+import logging
 
-console = Console(stderr=True)
+console = Console()
 
-def log_info(msg: str):
-    console.print(f"[blue][INFO][/blue] {msg}")
 
-def log_success(msg: str):
-    console.print(f"[green][OK][/green] {msg}")
+def setup_logging(verbose: bool = False) -> logging.Logger:
+    """Configure and return the ``nexa`` logger with Rich output."""
+    level = logging.DEBUG if verbose else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format="%(message)s",
+        datefmt="[%X]",
+        handlers=[RichHandler(console=console, rich_tracebacks=True)],
+    )
+    logger = logging.getLogger("nexa")
+    logger.setLevel(level)
+    return logger
 
-def log_warn(msg: str):
-    console.print(f"[yellow][WARN][/yellow] {msg}")
 
-def log_error(msg: str):
-    console.print(f"[red][ERROR][/red] {msg}")
-
-def check_ffmpeg():
-    if shutil.which("ffmpeg") is None:
-        log_error("FFmpeg is not installed or not found in PATH.")
-        log_error("Install it with: sudo apt install ffmpeg  (Linux) or brew install ffmpeg  (macOS)")
-        raise SystemExit(1)
+def check_ffmpeg() -> bool:
+    """Print FFmpeg status and return availability."""
+    available = shutil.which("ffmpeg") is not None
+    if available:
+        console.print("[green]FFmpeg found.[/]")
+    else:
+        console.print(
+            "[yellow]FFmpeg not found — video processing will be limited.[/]"
+        )
+    return available

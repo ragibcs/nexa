@@ -1,41 +1,57 @@
-import mimetypes
-import subprocess
-import json
+"""Video format detection, frame counting, and I/O helpers."""
+
+from __future__ import annotations
+
 from pathlib import Path
 
-VIDEO_EXTENSIONS = {'.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.ts', '.mts'}
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
+import imageio.v3 as iio
+from rich.console import Console
 
-def is_video(path: Path) -> bool:
-    mime_type, _ = mimetypes.guess_type(str(path))
-    if mime_type:
-        return mime_type.startswith('video')
-    return path.suffix.lower() in VIDEO_EXTENSIONS
+console = Console()
 
-def is_image(path: Path) -> bool:
-    mime_type, _ = mimetypes.guess_type(str(path))
-    if mime_type:
-        return mime_type.startswith('image')
-    return path.suffix.lower() in IMAGE_EXTENSIONS
+# Common video extensions
+VIDEO_EXTENSIONS = {
+    ".mp4", ".avi", ".mov", ".mkv", ".webm", ".flv", ".wmv", ".m4v",
+}
 
-def get_video_info(path: Path) -> dict:
-    """Probe video metadata using ffprobe."""
-    command = [
-        'ffprobe', '-v', 'quiet', '-print_format', 'json',
-        '-show_streams', '-show_format', str(path)
-    ]
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif", ".webp",
+}
+
+
+def is_video(path: str | Path) -> bool:
+    """Return ``True`` if *path* has a video extension."""
+    return Path(path).suffix.lower() in VIDEO_EXTENSIONS
+
+
+def is_image(path: str | Path) -> bool:
+    """Return ``True`` if *path* has an image extension."""
+    return Path(path).suffix.lower() in IMAGE_EXTENSIONS
+
+
+def count_frames(path: str | Path) -> int:
+    """Return the number of frames in a video file."""
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=True)
-        return json.loads(result.stdout)
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        return {}
+        props = iio.improps(str(path), plugin="pyav")
+        if hasattr(props, "n_images"):
+            return props.n_images
+    except Exception:
+        pass
 
-def get_frame_count(path: Path) -> int:
-    """Get total frame count from video metadata."""
-    info = get_video_info(path)
-    for stream in info.get('streams', []):
-        if stream.get('codec_type') == 'video':
-            count = stream.get('nb_frames')
-            if count and count != 'N/A':
-                return int(count)
-    return 0
+    # Fallback: iterate and count
+    count = 0
+    try:
+        for _ in iio.imiter(str(path), plugin="pyav"):
+            count += 1
+    except Exception:
+        pass
+    return count
+
+
+def get_fps(path: str | Path) -> float:
+    """Return the FPS of a video file (default 30.0)."""
+    try:
+        meta = iio.immeta(str(path), plugin="pyav")
+        return float(meta.get("fps", 30.0))
+    except Exception:
+        return 30.0

@@ -1,156 +1,174 @@
-<div align="center">
+# Nexa — Diffusion-Based Face Swapper
 
-# Nexa 🎭
+**IP-Adapter FaceID + Stable Diffusion 1.5** headless CLI tool for photorealistic face swapping in images and videos.
 
-**Improved Headless Face Swapper**
+## Features
 
-[![Python Version](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
-[![Typer CLI](https://img.shields.io/badge/CLI-Typer-brightgreen.svg)](https://typer.tiangolo.com/)
-[![ONNX Runtime](https://img.shields.io/badge/Backend-ONNXRuntime-blueviolet.svg)](https://onnxruntime.ai/)
+- **Diffusion-based face swap** using IP-Adapter FaceID (not traditional GAN-based)
+- **Single-face** and **multi-face** mapping modes
+- **Video processing** with audio preservation
+- **Face enhancement** via GFPGAN post-processing
+- **Colab-ready** — runs on free T4 GPU (~6-7 GB VRAM)
+- **CLI + Python API** — use from terminal or import in your code
 
-A modern, quick, and completely headless command-line tool for swapping faces. Nexa is a new version of the old "roop" project. It was built from the ground up to get rid of huge disk I/O bottlenecks by processing video streams completely in memory. It also has advanced features like being able to map multiple faces in one video.
+## Architecture
 
-</div>
-
----
-
-## ✨ Main Features
-
-- **🚀 In-Memory Processing**: Unlike older tools that save thousands of images to your hard drive, Nexa streams video frames directly into memory, processes them, and writes them out. No more SSD thrashing.
-- **👯 Multi-Face Mapping**: Do you want to switch out a bunch of different people in the same video? Nexa can do specific source-to-target face mapping using cosine similarity.
-- **💻 Fully Headless**: Made to be a command line interface (CLI) tool. Simple to add to scripts, pipelines, or run on remote servers or Colab without needing a user interface.
-- **🔊 Audio Preservation**: Automatically takes the original audio track and adds it back into the final video that has been swapped.
-- **📦 Automatic Model Management**: When you first run the program, it automatically downloads the models it needs (InsightFace, Inswapper) and stores them in memory.
-
-## ⚙️ How It Works
-
-Nexa uses `imageio` and `ffmpeg` to handle video streams quickly and easily. It uses the `insightface` (buffalo_l model) to find and recognize faces. The `inswapper_128.onnx` model running on `onnxruntime` does the actual face swapping.
-
----
-
-## 💻 Installation (Local)
-
-### What You Need
-
-- Python 3.10 or higher
-- FFmpeg is installed and in your system PATH (`sudo apt install ffmpeg` or `brew install ffmpeg`)
-
-### Use pip (or uv) to install
-
-1. Copy the repository:
-   ```bash
-   git clone https://github.com/ragibcs/nexa.git
-   cd nexa
-   ```
-
-2. Set up the package:
-   ```bash
-   pip install -e .
-   # OR with uv:
-   uv pip install -e .
-   ```
-
-*(Note: For hardware acceleration, you might want to install the `onnxruntime-gpu` package instead of the default CPU version, depending on your hardware.)*
-
----
-
-## 🚀 How to Use
-
-You can only control Nexa from the command line.
-
-### Simple Face Swap
-
-Use the following command to replace all the faces in a target video or image with a single source face:
-
-```bash
-nexa --source person.jpg --target input_video.mp4 --output swapped_video.mp4
+```
+nexa/
+├── src/nexa/
+│   ├── main.py              # Typer CLI entry point
+│   ├── core/
+│   │   ├── pipeline.py      # Orchestrates image/video processing
+│   │   ├── mapping.py       # Maps source→target faces via embeddings
+│   │   └── audio.py         # FFmpeg audio extract/mux for video
+│   ├── models/
+│   │   ├── analyzer.py      # InsightFace buffalo_l face detection
+│   │   ├── swapper.py       # IP-Adapter FaceID diffusion engine (CORE)
+│   │   ├── enhancers.py     # GFPGAN / CodeFormer post-processing
+│   │   └── manager.py       # Model download manager
+│   └── utils/
+│       ├── video.py         # Video format detection, frame counting
+│       └── logging.py       # Rich-based colored logging
+├── new.ipynb                # Google Colab notebook
+├── pyproject.toml           # Package config with [gpu] extras
+├── requirements.txt         # Flat dependency list
+└── README.md
 ```
 
-### Mapping Multiple Faces
+## Quick Start (Google Colab)
 
-In a video with more than one person, tell exactly which source face goes on which target face:
+1. **Upload** the `nexa` folder to `/content/` in Colab
+2. **Open** `new.ipynb` and follow the cells
+3. **Set runtime** to GPU (Runtime → Change runtime type → T4 GPU)
+4. Run cells in order:
+   - Install dependencies
+   - Install FFmpeg
+   - Upload source & target images
+   - Run face swap
 
-```bash
-nexa \
-  --map "actor1.jpg:target_face1.jpg" \
-  --map "actor2.jpg:target_face2.jpg" \
-  --target group_video.mp4 \
-  --output mapped_video.mp4
-```
-
-*(How it works: Nexa looks at `target_face1.jpg` and `target_face2.jpg` to get reference embeddings. When it processes `group_video.mp4`, it uses these references to find the right source face by comparing the faces it finds.)*
-
-### Menu of Help
-
-To see all the options:
+Or use the CLI directly:
 
 ```bash
-nexa --help
+%cd /content/nexa
+!pip install -e ".[gpu]"
+!nexa --source /content/source.jpg --target /content/target.jpg --output /content/output.jpg --steps 20 --gpu
 ```
 
----
+## CLI Usage
 
-## ☁️ How to Run in Google Colab
+```bash
+# Single face swap
+nexa --source face.jpg --target photo.jpg --output result.jpg --gpu
 
-You can easily run Nexa in a free Google Colab notebook that has GPU support.
+# Multi-face mapping
+nexa -m alice.jpg:person1.jpg -m bob.jpg:person2.jpg -t group.jpg -o out.jpg --gpu
 
-1. Make a new notebook in Google Colab.
-2. Choose **T4 GPU** from the **Runtime > Change runtime type** menu.
-3. Make a cell and run these setup commands:
+# Video processing
+nexa -s face.jpg -t video.mp4 -o output.mp4 --gpu --enhancer gfpgan
+
+# Custom parameters for better quality
+nexa -s face.jpg -t photo.jpg -o result.jpg --gpu \
+  --steps 25 --strength 0.6 --guidance-scale 6.0 --ip-scale 1.2
+```
+
+### CLI Arguments
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--source / -s` | None | Source face image (single-face mode) |
+| `--target / -t` | *required* | Target image or video |
+| `--output / -o` | *required* | Output file path |
+| `--map / -m` | None | Multi-face mapping `src.jpg:tgt.jpg` (repeatable) |
+| `--model / -M` | `runwayml/stable-diffusion-v1-5` | HuggingFace SD1.5 model ID |
+| `--steps` | 20 | Diffusion inference steps (15-30 recommended) |
+| `--strength` | 0.65 | How much to change the init image (0=none, 1=full) |
+| `--guidance-scale` | 5.0 | Classifier-free guidance scale |
+| `--ip-scale` | 1.0 | IP-Adapter face identity strength |
+| `--enhancer / -e` | None | Face enhancer: `gfpgan` or `codeformer` |
+| `--gpu` | False | Use CUDA acceleration |
+| `--threshold` | 0.6 | Cosine similarity threshold for face matching |
+
+## Python API
 
 ```python
-# 1. Install prerequisites and FFmpeg
-!apt-get update && apt-get install -y ffmpeg
-!pip install -q onnxruntime-gpu insightface imageio[ffmpeg] ffmpeg-python typer rich opencv-python-headless tqdm requests
+from nexa.core.pipeline import NexaPipeline
 
-# 2. Copy the repository (if you need to, change the URL to your own)
-# !git clone https://github.com/ragibcs/nexa.git
-# %cd nexa
-# !pip install -e .
+pipeline = NexaPipeline(
+    model_id="runwayml/stable-diffusion-v1-5",
+    device="cuda",
+    steps=20,
+    enhancer_name="gfpgan",
+    ip_scale=1.0,
+    strength=0.65,
+    guidance_scale=5.0,
+)
 
-# If you only uploaded the source code folder to Colab, you can also do this:
-# %cd /content/nexa
-# !pip install -e .
+# Single face swap
+pipeline.process_image_single("source.jpg", "target.jpg", "output.jpg")
+
+# Video
+pipeline.process_video("source.jpg", "video.mp4", "output.mp4")
 ```
 
-4. Send in your media:
-   - On the left sidebar, click the **Folder** icon.
-   - Put your `source.jpg` and `target.mp4` files online.
+## How It Works
 
-5. In a new cell, run Nexa with the command:
-   ```bash
-   !nexa --source source.jpg --target target.mp4 --output result.mp4
-   ```
+### Face Swap Pipeline (per frame)
 
-6. Get the result!
+1. **Detect faces** in target image using InsightFace (`buffalo_l`)
+2. **Extract** 512-d ArcFace embeddings from source and target faces
+3. For each face:
+   - **Crop** expanded bounding box (1.6×) around target face
+   - **Create soft mask** from landmark convex hull (dilated + blurred)
+   - **Project** source embedding through FaceIDProjModel → 4 tokens
+   - **Concatenate** face tokens with text prompt embeddings
+   - **Run SD1.5 img2img** with cropped region as init image
+   - **Composite** result back using soft mask (alpha blending)
+4. Optionally **enhance** all faces with GFPGAN
 
----
+### Core Technology
 
-## 📁 Structure of the Project
+- **IP-Adapter FaceID** — custom implementation with `nn.Linear` attention processors (no deprecated `LoRALinearLayer`)
+- **DDIM Scheduler** — 20 steps, guidance scale 5.0, strength 0.65
+- **CPU Offload** — keeps peak VRAM under 8 GB on T4
 
-```text
-nexa/
-├── pyproject.toml              # Packaging for modern Python
-├── requirements.txt            # List of fallback dependencies
-└── src/
-    └── nexa/
-        ├── __init__.py
-        ├── main.py             # Typer CLI entrypoint
-        ├── core/
-        │   ├── pipeline.py     # In-memory video/image processing loop
-        │   ├── mapping.py      # Cosine-similarity face matching engine
-        │   └── audio.py        # Audio extraction and muxing via FFmpeg
-        ├── models/
-        │   ├── manager.py      # Automatic model downloading with progress bar
-        │   ├── providers.py    # GPU / CPU provider auto-detection
-        │   ├── analyzer.py     # InsightFace detection wrapper
-        │   ├── swapper.py      # Inswapper ONNX execution wrapper
-        │   └── enhancers.py    # GFPGAN / CodeFormer face restoration
-        └── utils/
-            ├── video.py        # FFprobe helpers and format detection
-            └── logging.py      # Rich console logger and FFmpeg check
+## Quality Tuning
+
+| Parameter | Effect | Recommended |
+|-----------|--------|-------------|
+| `strength` | How much to change the init image | 0.5-0.7 |
+| `guidance_scale` | How strongly to follow the prompt | 4.0-7.0 |
+| `steps` | More steps = better quality, slower | 15-30 |
+| `ip_scale` | Face identity strength | 0.8-1.5 |
+
+## Memory Budget (T4 — 15 GB VRAM)
+
+| Component | VRAM |
+|-----------|------|
+| SD1.5 UNet (float16) | ~3.4 GB |
+| Text Encoder (float16) | ~0.5 GB |
+| VAE (float16) | ~0.3 GB |
+| IP-Adapter processors | ~0.2 GB |
+| Inference overhead | ~2-3 GB |
+| **Total** | **~6-7 GB** |
+
+## Installation (Local)
+
+```bash
+# Clone
+git clone https://github.com/YOUR_USERNAME/nexa.git
+cd nexa
+
+# Install (CPU)
+pip install -e .
+
+# Install (GPU)
+pip uninstall -y onnxruntime
+pip install -e ".[gpu]"
+
+# FFmpeg (for video)
+sudo apt install ffmpeg
 ```
 
-## ⚠️ Warning
+## License
 
-This software is only meant for school, research, and fun. Users are not allowed to use this tool to make deepfakes or change media for bad reasons, such as harassment, spreading false information, or any other activity that violates the rights of others. Please use this tool responsibly and make sure you have permission from the people whose faces you are switching.
+This project is for **research purposes only**. InsightFace models are licensed for non-commercial use.
