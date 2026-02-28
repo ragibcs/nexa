@@ -2,14 +2,21 @@
 
 from __future__ import annotations
 
+import shutil
 import tempfile
+import traceback
 from pathlib import Path
 
 import cv2
-import imageio.v3 as iio
 import numpy as np
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    BarColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 
 from nexa.core.audio import extract_audio, mux_audio
 from nexa.core.mapping import FaceMapper
@@ -35,7 +42,12 @@ class NexaPipeline:
         strength: float = 0.65,
         guidance_scale: float = 5.0,
     ) -> None:
+        console.print("[bold cyan]Initializing Nexa Pipeline…[/]")
+
+        console.print("[dim]Step 1/3: Loading face analyzer…[/]")
         self.analyzer = FaceAnalyzer()
+
+        console.print("[dim]Step 2/3: Loading face swapper…[/]")
         self.swapper = FaceSwapper(
             model_id=model_id,
             device=device,
@@ -44,8 +56,12 @@ class NexaPipeline:
             strength=strength,
             guidance_scale=guidance_scale,
         )
+
+        console.print("[dim]Step 3/3: Loading enhancer…[/]")
         self.enhancer = get_enhancer(enhancer_name)
         self.mapper = FaceMapper(threshold=threshold)
+
+        console.print("[bold green]Pipeline ready.[/]\n")
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -64,27 +80,44 @@ class NexaPipeline:
         if target_img is None:
             raise FileNotFoundError(f"Cannot read target: {target_path}")
 
+        console.print(f"[dim]Source image: {source_img.shape[1]}x{source_img.shape[0]}[/]")
+        console.print(f"[dim]Target image: {target_img.shape[1]}x{target_img.shape[0]}[/]")
+
         # Detect source face
+        console.print("[dim]Detecting source face…[/]")
         src_faces = self.analyzer.detect(source_img)
         if not src_faces:
             raise RuntimeError(f"No face detected in source: {source_path}")
+        console.print(f"[dim]Found {len(src_faces)} face(s) in source.[/]")
         src_emb = self.analyzer.embedding(src_faces[0])
 
         # Detect target faces
+        console.print("[dim]Detecting target face(s)…[/]")
         tgt_faces = self.analyzer.detect(target_img)
         if not tgt_faces:
             console.print("[yellow]No faces detected in target — copying as-is.[/]")
             cv2.imwrite(str(output_path), target_img)
             return Path(output_path)
+        console.print(f"[dim]Found {len(tgt_faces)} face(s) in target.[/]")
 
         # Swap each target face
         result = target_img.copy()
-        for face in tgt_faces:
-            result = self.swapper.swap_face_in_image(result, face, src_emb)
+        for i, face in enumerate(tgt_faces):
+            console.print(f"[bold cyan]Swapping face {i + 1}/{len(tgt_faces)}…[/]")
+            try:
+                result = self.swapper.swap_face_in_image(result, face, src_emb)
+                console.print(f"[green]✓ Face {i + 1} swapped.[/]")
+            except Exception as e:
+                console.print(f"[red]✗ Face {i + 1} failed: {e}[/]")
+                traceback.print_exc()
 
         # Enhance
         if self.enhancer is not None:
-            result = self.enhancer.enhance(result)
+            console.print("[dim]Enhancing faces…[/]")
+            try:
+                result = self.enhancer.enhance(result)
+            except Exception as e:
+                console.print(f"[yellow]Enhancement failed: {e}[/]")
 
         cv2.imwrite(str(output_path), result)
         console.print(f"[bold green]Saved:[/] {output_path}")
@@ -121,7 +154,6 @@ class NexaPipeline:
                 raise RuntimeError(f"No face in reference: {ref_path}")
 
             self.mapper.add_source(str(src_path), self.analyzer.embedding(src_faces[0]))
-            # Also register the reference embedding for matching
             self.mapper.add_source(
                 f"_ref_{ref_path}",
                 self.analyzer.embedding(ref_faces[0]),
@@ -156,6 +188,8 @@ class NexaPipeline:
         output_path: str | Path,
     ) -> Path:
         """Single-source face swap on a video."""
+        import imageio.v3 as iio
+
         source_img = cv2.imread(str(source_path))
         if source_img is None:
             raise FileNotFoundError(f"Cannot read source: {source_path}")
@@ -194,21 +228,24 @@ class NexaPipeline:
             task = progress.add_task("Swapping faces", total=total)
 
             for frame in iio.imiter(str(target_path), plugin="pyav"):
-                # frame is RGB numpy array
                 frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                # Detect faces in this frame
                 faces = self.analyzer.detect(frame_bgr)
                 if faces:
                     for face in faces:
-                        frame_bgr = self.swapper.swap_face_in_image(
-                            frame_bgr, face, src_emb
-                        )
+                        try:
+                            frame_bgr = self.swapper.swap_face_in_image(
+                                frame_bgr, face, src_emb
+                            )
+                        except Exception:
+                            pass  # Skip failed frames silently
 
                     if self.enhancer is not None:
-                        frame_bgr = self.enhancer.enhance(frame_bgr)
+                        try:
+                            frame_bgr = self.enhancer.enhance(frame_bgr)
+                        except Exception:
+                            pass
 
-                # Convert back to RGB for writer
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
                 writer.write_frame(frame_rgb)
                 progress.advance(task)
@@ -219,12 +256,10 @@ class NexaPipeline:
         if has_audio:
             mux_audio(tmp_video, audio_file, output_path)
         else:
-            import shutil
             shutil.copy2(tmp_video, output_path)
 
         # Cleanup
-        import shutil as _shutil
-        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
         console.print(f"[bold green]Saved:[/] {output_path}")
         return output_path

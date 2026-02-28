@@ -1,16 +1,19 @@
 """IP-Adapter FaceID diffusion-based face swap engine (CORE).
 
-This module implements the IP-Adapter FaceID mechanism **directly** using
-custom ``nn.Module`` classes, avoiding the deprecated ``ip_adapter`` pip
-package and the version-fragile ``pipeline.load_ip_adapter()`` API.
+This module re-implements the IP-Adapter FaceID mechanism faithfully
+following the official ``tencent-ailab/IP-Adapter`` repository, but
+without depending on the ``ip_adapter`` pip package or the deprecated
+``LoRALinearLayer`` import.
 
 Architecture
 ------------
-1. ``FaceIDProjModel``  — MLP that projects 512-d InsightFace embeddings
+1. ``MLPProjModel``         — MLP that projects 512-d InsightFace embeddings
    into (batch, num_tokens, cross_attention_dim) for SD1.5.
-2. ``IPAttnProcessor``  — Custom cross-attention processor that adds
-   scaled IP-Adapter attention using plain ``nn.Linear`` layers.
-3. ``FaceSwapper``      — High-level class that loads the SD1.5 pipeline,
+2. ``LoRALinearLayerSimple``— Drop-in replacement for the removed
+   ``diffusers.models.lora.LoRALinearLayer``.
+3. ``LoRAAttnProcessor``    — Self-attention processor with LoRA.
+4. ``LoRAIPAttnProcessor``  — Cross-attention processor with LoRA + IP-Adapter.
+5. ``FaceSwapper``          — High-level class that loads the SD1.5 pipeline,
    wires up the IP-Adapter processors, and exposes a ``swap()`` method.
 """
 
@@ -30,7 +33,6 @@ from diffusers import (
     DDIMScheduler,
     StableDiffusionImg2ImgPipeline,
 )
-from diffusers.models.attention_processor import AttnProcessor2_0
 from PIL import Image
 from rich.console import Console
 from scipy.ndimage import binary_dilation
@@ -40,61 +42,100 @@ from nexa.models.manager import download_ip_adapter_faceid
 console = Console()
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 1. FaceID Projection Model
+# 1. Drop-in LoRA Linear Layer (replaces deprecated diffusers LoRALinearLayer)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class FaceIDProjModel(nn.Module):
-    """Project 512-d ArcFace embedding → (B, num_tokens, cross_attention_dim)."""
+class LoRALinearLayerSimple(nn.Module):
+    """Minimal LoRA layer: down-project then up-project."""
 
     def __init__(
         self,
-        embedding_dim: int = 512,
+        in_features: int,
+        out_features: int,
+        rank: int = 4,
+        network_alpha: float | None = None,
+    ) -> None:
+        super().__init__()
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        self.network_alpha = network_alpha
+        self.rank = rank
+        # Initialize: down with kaiming, up with zeros (standard LoRA init)
+        nn.init.kaiming_uniform_(self.down.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        down = self.down(x)
+        up = self.up(down)
+        if self.network_alpha is not None:
+            up = up * (self.network_alpha / self.rank)
+        return up
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 2. MLPProjModel — matches official checkpoint exactly
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class MLPProjModel(nn.Module):
+    """Project 512-d ArcFace embedding → (B, num_tokens, cross_attention_dim).
+
+    Architecture matches the official ``MLPProjModel`` in
+    ``tencent-ailab/IP-Adapter/ip_adapter/ip_adapter_faceid.py``:
+        Linear(512 → 1024) → GELU → Linear(1024 → 768*4)
+    """
+
+    def __init__(
+        self,
         cross_attention_dim: int = 768,
+        id_embeddings_dim: int = 512,
         num_tokens: int = 4,
     ) -> None:
         super().__init__()
-        self.num_tokens = num_tokens
         self.cross_attention_dim = cross_attention_dim
+        self.num_tokens = num_tokens
         self.proj = nn.Sequential(
-            nn.Linear(embedding_dim, cross_attention_dim),
+            nn.Linear(id_embeddings_dim, id_embeddings_dim * 2),
             nn.GELU(),
-            nn.Linear(cross_attention_dim, cross_attention_dim * num_tokens),
+            nn.Linear(id_embeddings_dim * 2, cross_attention_dim * num_tokens),
         )
         self.norm = nn.LayerNorm(cross_attention_dim)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, 512)
-        x = self.proj(x)                                       # (B, 768*4)
-        x = x.reshape(-1, self.num_tokens, self.cross_attention_dim)  # (B, 4, 768)
+    def forward(self, id_embeds: torch.Tensor) -> torch.Tensor:
+        x = self.proj(id_embeds)
+        x = x.reshape(-1, self.num_tokens, self.cross_attention_dim)
         x = self.norm(x)
         return x
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 2. IP-Adapter Cross-Attention Processor
+# 3. Attention Processors — match official checkpoint key structure
 # ═══════════════════════════════════════════════════════════════════════════════
 
-class IPAttnProcessor(nn.Module):
-    """Cross-attention processor that adds IP-Adapter face identity tokens.
+class LoRAAttnProcessor(nn.Module):
+    """Self-attention processor with LoRA (replaces LoRAAttnProcessor2_0).
 
-    Uses **only** ``nn.Linear`` (no deprecated ``LoRALinearLayer``).
+    Parameters in state_dict:
+        to_q_lora.down.weight, to_q_lora.up.weight,
+        to_k_lora.down.weight, to_k_lora.up.weight,
+        to_v_lora.down.weight, to_v_lora.up.weight,
+        to_out_lora.down.weight, to_out_lora.up.weight
     """
 
     def __init__(
         self,
         hidden_size: int,
-        cross_attention_dim: int,
-        num_tokens: int = 4,
-        scale: float = 1.0,
+        cross_attention_dim: int | None = None,
+        rank: int = 128,
+        network_alpha: float | None = None,
+        lora_scale: float = 1.0,
     ) -> None:
         super().__init__()
-        self.hidden_size = hidden_size
-        self.cross_attention_dim = cross_attention_dim
-        self.num_tokens = num_tokens
-        self.scale = scale
-
-        self.to_k_ip = nn.Linear(cross_attention_dim, hidden_size, bias=False)
-        self.to_v_ip = nn.Linear(cross_attention_dim, hidden_size, bias=False)
+        self.rank = rank
+        self.lora_scale = lora_scale
+        self.to_q_lora = LoRALinearLayerSimple(hidden_size, hidden_size, rank, network_alpha)
+        self.to_k_lora = LoRALinearLayerSimple(cross_attention_dim or hidden_size, hidden_size, rank, network_alpha)
+        self.to_v_lora = LoRALinearLayerSimple(cross_attention_dim or hidden_size, hidden_size, rank, network_alpha)
+        self.to_out_lora = LoRALinearLayerSimple(hidden_size, hidden_size, rank, network_alpha)
 
     def __call__(
         self,
@@ -103,6 +144,7 @@ class IPAttnProcessor(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         attention_mask=None,
         temb=None,
+        *args,
         **kwargs,
     ) -> torch.Tensor:
         residual = hidden_states
@@ -112,36 +154,26 @@ class IPAttnProcessor(nn.Module):
 
         input_ndim = hidden_states.ndim
         if input_ndim == 4:
-            batch, channel, height, width = hidden_states.shape
-            hidden_states = hidden_states.view(batch, channel, height * width).transpose(1, 2)
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
 
         batch_size, sequence_length, _ = (
-            hidden_states.shape
-            if encoder_hidden_states is None
-            else encoder_hidden_states.shape
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
         )
-
-        if attention_mask is not None:
-            attention_mask = attn.prepare_attention_mask(
-                attention_mask, sequence_length, batch_size
-            )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
 
         if attn.group_norm is not None:
             hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        query = attn.to_q(hidden_states)
+        query = attn.to_q(hidden_states) + self.lora_scale * self.to_q_lora(hidden_states)
 
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
 
-        # ── Split text tokens and IP tokens ──────────────────────────────────
-        end_pos = encoder_hidden_states.shape[1] - self.num_tokens
-        text_hs = encoder_hidden_states[:, :end_pos, :]
-        ip_hs = encoder_hidden_states[:, end_pos:, :]
-
-        # Standard text cross-attention
-        key = attn.to_k(text_hs)
-        value = attn.to_v(text_hs)
+        key = attn.to_k(encoder_hidden_states) + self.lora_scale * self.to_k_lora(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states) + self.lora_scale * self.to_v_lora(encoder_hidden_states)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // attn.heads
@@ -153,44 +185,156 @@ class IPAttnProcessor(nn.Module):
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-
-        # IP-Adapter attention
-        ip_key = self.to_k_ip(ip_hs)
-        ip_value = self.to_v_ip(ip_hs)
-
-        ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-        ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-        ip_hidden = F.scaled_dot_product_attention(
-            query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
-        )
-
-        hidden_states = hidden_states + self.scale * ip_hidden
-
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, inner_dim)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
 
-        # Linear projection + dropout
-        hidden_states = attn.to_out[0](hidden_states)
+        # linear proj + LoRA
+        hidden_states = attn.to_out[0](hidden_states) + self.lora_scale * self.to_out_lora(hidden_states)
+        # dropout
         hidden_states = attn.to_out[1](hidden_states)
 
         if input_ndim == 4:
-            hidden_states = hidden_states.transpose(-1, -2).reshape(batch, channel, height, width)
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
         if attn.residual_connection:
             hidden_states = hidden_states + residual
 
         hidden_states = hidden_states / attn.rescale_output_factor
+        return hidden_states
 
+
+class LoRAIPAttnProcessor(nn.Module):
+    """Cross-attention processor with LoRA + IP-Adapter face tokens.
+
+    Parameters in state_dict:
+        to_q_lora.down.weight, to_q_lora.up.weight,
+        to_k_lora.down.weight, to_k_lora.up.weight,
+        to_v_lora.down.weight, to_v_lora.up.weight,
+        to_out_lora.down.weight, to_out_lora.up.weight,
+        to_k_ip.weight, to_v_ip.weight
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        cross_attention_dim: int | None = None,
+        rank: int = 128,
+        network_alpha: float | None = None,
+        lora_scale: float = 1.0,
+        scale: float = 1.0,
+        num_tokens: int = 4,
+    ) -> None:
+        super().__init__()
+        self.rank = rank
+        self.lora_scale = lora_scale
+        self.num_tokens = num_tokens
+        self.scale = scale
+
+        self.to_q_lora = LoRALinearLayerSimple(hidden_size, hidden_size, rank, network_alpha)
+        self.to_k_lora = LoRALinearLayerSimple(cross_attention_dim or hidden_size, hidden_size, rank, network_alpha)
+        self.to_v_lora = LoRALinearLayerSimple(cross_attention_dim or hidden_size, hidden_size, rank, network_alpha)
+        self.to_out_lora = LoRALinearLayerSimple(hidden_size, hidden_size, rank, network_alpha)
+
+        self.to_k_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+        self.to_v_ip = nn.Linear(cross_attention_dim or hidden_size, hidden_size, bias=False)
+
+    def __call__(
+        self,
+        attn,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor | None = None,
+        attention_mask=None,
+        temb=None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        residual = hidden_states
+
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states) + self.lora_scale * self.to_q_lora(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        else:
+            # Split text tokens and IP tokens
+            end_pos = encoder_hidden_states.shape[1] - self.num_tokens
+            encoder_hidden_states, ip_hidden_states = (
+                encoder_hidden_states[:, :end_pos, :],
+                encoder_hidden_states[:, end_pos:, :],
+            )
+            if attn.norm_cross:
+                encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        # Standard text cross-attention with LoRA
+        key = attn.to_k(encoder_hidden_states) + self.lora_scale * self.to_k_lora(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states) + self.lora_scale * self.to_v_lora(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        hidden_states = F.scaled_dot_product_attention(
+            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        )
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # IP-Adapter attention
+        ip_key = self.to_k_ip(ip_hidden_states)
+        ip_value = self.to_v_ip(ip_hidden_states)
+
+        ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        ip_hidden_states = F.scaled_dot_product_attention(
+            query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
+        )
+        ip_hidden_states = ip_hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        ip_hidden_states = ip_hidden_states.to(query.dtype)
+
+        hidden_states = hidden_states + self.scale * ip_hidden_states
+
+        # linear proj + LoRA
+        hidden_states = attn.to_out[0](hidden_states) + self.lora_scale * self.to_out_lora(hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
         return hidden_states
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# 3. FaceSwapper — high-level swap engine
+# 4. FaceSwapper — high-level swap engine
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class FaceSwapper:
     """Loads SD1.5 + IP-Adapter FaceID and exposes ``swap()``."""
+
+    LORA_RANK = 128  # must match the checkpoint
 
     def __init__(
         self,
@@ -228,135 +372,116 @@ class FaceSwapper:
             feature_extractor=None,
         )
 
+        # Move pipe to device FIRST (official does this)
+        self.pipe = self.pipe.to(self.device)
+        console.print(f"[green]Pipeline loaded on {self.device}.[/]")
+
         # ── Build IP-Adapter components ──────────────────────────────────────
         cross_dim = self.pipe.unet.config.cross_attention_dim  # 768 for SD1.5
-        self.image_proj_model = FaceIDProjModel(
-            embedding_dim=512,
-            cross_attention_dim=cross_dim,
-            num_tokens=num_tokens,
-        )
 
-        # Set attention processors
+        # Set attention processors (LoRA + IP-Adapter)
         self._set_ip_adapter_processors(cross_dim)
 
-        # Load weights
+        # Image projection model
+        self.image_proj_model = MLPProjModel(
+            cross_attention_dim=cross_dim,
+            id_embeddings_dim=512,
+            num_tokens=num_tokens,
+        ).to(self.device, dtype=self.dtype)
+
+        # Load weights from checkpoint
         self._load_ip_adapter_weights()
-
-        # Move image_proj_model to device
-        self.image_proj_model = self.image_proj_model.to(self.device, dtype=self.dtype)
-
-        # Enable CPU offload AFTER processor setup
-        if self.device.type == "cuda":
-            self.pipe.enable_model_cpu_offload()
-            console.print("[green]CPU offload enabled.[/]")
-
-        # Pre-encode the text prompts (reused for every swap)
-        self._encode_text_prompts()
 
         console.print("[bold green]FaceSwapper ready.[/]")
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
     def _set_ip_adapter_processors(self, cross_dim: int) -> None:
-        """Assign IPAttnProcessor to every cross-attention layer in UNet."""
-        attn_procs: dict[str, nn.Module] = {}
+        """Assign LoRA + IP-Adapter processors exactly like the official code."""
         unet = self.pipe.unet
-        for name in unet.attn_processors.keys():
-            if name.endswith("attn1.processor"):
-                # Self-attention → standard processor
-                attn_procs[name] = AttnProcessor2_0()
-            else:
-                # Cross-attention → IP-Adapter processor
-                # Determine hidden_size from the layer
-                parts = name.split(".")
-                # Walk the module tree to find hidden_size
-                hidden_size = self._get_hidden_size(unet, parts)
-                attn_procs[name] = IPAttnProcessor(
-                    hidden_size=hidden_size,
-                    cross_attention_dim=cross_dim,
-                    num_tokens=self.num_tokens,
-                    scale=self.ip_scale,
-                )
-        unet.set_attn_processor(attn_procs)
-        console.print(
-            f"[dim]Installed {sum(1 for v in attn_procs.values() if isinstance(v, IPAttnProcessor))} "
-            f"IPAttnProcessors.[/]"
-        )
+        attn_procs: dict[str, nn.Module] = {}
 
-    @staticmethod
-    def _get_hidden_size(unet: nn.Module, name_parts: list[str]) -> int:
-        """Resolve the hidden_size of a cross-attention layer from its name."""
-        # Navigate to the parent attention module
-        module = unet
-        # name_parts looks like: ['down_blocks', '0', 'attentions', '0', 'transformer_blocks', '0', 'attn2', 'processor']
-        for part in name_parts[:-1]:  # skip 'processor'
-            if part.isdigit():
-                module = module[int(part)]
+        for name in unet.attn_processors.keys():
+            cross_attention_dim = (
+                None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+            )
+
+            # Resolve hidden_size from block config (official method)
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = unet.config.block_out_channels[block_id]
             else:
-                module = getattr(module, part)
-        # module is now the Attention layer — inner_dim == to_q.out_features
-        return module.to_q.out_features
+                # Fallback — shouldn't happen for SD1.5
+                hidden_size = cross_dim
+
+            if cross_attention_dim is None:
+                # Self-attention → LoRA only
+                attn_procs[name] = LoRAAttnProcessor(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=cross_attention_dim,
+                    rank=self.LORA_RANK,
+                ).to(self.device, dtype=self.dtype)
+            else:
+                # Cross-attention → LoRA + IP-Adapter
+                attn_procs[name] = LoRAIPAttnProcessor(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=cross_attention_dim,
+                    rank=self.LORA_RANK,
+                    scale=self.ip_scale,
+                    num_tokens=self.num_tokens,
+                ).to(self.device, dtype=self.dtype)
+
+        unet.set_attn_processor(attn_procs)
+
+        n_ip = sum(1 for v in attn_procs.values() if isinstance(v, LoRAIPAttnProcessor))
+        n_lora = sum(1 for v in attn_procs.values() if isinstance(v, LoRAAttnProcessor))
+        console.print(
+            f"[dim]Installed {n_lora} LoRA self-attn + {n_ip} LoRA+IP cross-attn processors.[/]"
+        )
 
     def _load_ip_adapter_weights(self) -> None:
-        """Download and load ``ip-adapter-faceid_sd15.bin`` weights."""
+        """Download and load ``ip-adapter-faceid_sd15.bin`` weights.
+
+        The official loading strategy:
+            ip_layers = nn.ModuleList(pipe.unet.attn_processors.values())
+            ip_layers.load_state_dict(state_dict["ip_adapter"])
+        This means the state_dict keys are indexed over ALL processors
+        (both self-attn and cross-attn) in order.
+        """
         ckpt_path = download_ip_adapter_faceid()
-        state_dict = torch.load(str(ckpt_path), map_location="cpu", weights_only=True)
+        console.print(f"[dim]Loading checkpoint: {ckpt_path}[/]")
+
+        state_dict = torch.load(str(ckpt_path), map_location="cpu")
 
         # 1. image_proj weights
-        proj_sd = state_dict["image_proj"]
-        # The checkpoint keys may be flat — map them
-        new_proj_sd = {}
-        for k, v in proj_sd.items():
-            new_proj_sd[k] = v
-        self.image_proj_model.load_state_dict(new_proj_sd, strict=False)
-        console.print("[dim]Loaded image_proj weights.[/]")
+        self.image_proj_model.load_state_dict(state_dict["image_proj"])
+        console.print("[dim]✓ Loaded image_proj weights.[/]")
 
-        # 2. ip_adapter weights → load into cross-attention processors
-        ip_sd = state_dict["ip_adapter"]
-        # ip_sd keys are like "0.to_k_ip.weight", "0.to_v_ip.weight", …
-        # Collect all IPAttnProcessors in order
-        ip_processors = nn.ModuleList(
-            [
-                proc
-                for proc in self.pipe.unet.attn_processors.values()
-                if isinstance(proc, IPAttnProcessor)
-            ]
-        )
-        ip_processors.load_state_dict(ip_sd, strict=False)
-        console.print(f"[dim]Loaded ip_adapter weights into {len(ip_processors)} processors.[/]")
+        # 2. ip_adapter weights → load into ALL processors (official method)
+        ip_layers = nn.ModuleList(self.pipe.unet.attn_processors.values())
+        ip_layers.load_state_dict(state_dict["ip_adapter"])
+        console.print(f"[dim]✓ Loaded ip_adapter weights into {len(ip_layers)} processors.[/]")
 
-    def _encode_text_prompts(self) -> None:
-        """Pre-encode the text prompt and negative prompt."""
-        tokenizer = self.pipe.tokenizer
-        text_encoder = self.pipe.text_encoder
+    def set_scale(self, scale: float) -> None:
+        """Update the IP-Adapter scale on all cross-attention processors."""
+        for proc in self.pipe.unet.attn_processors.values():
+            if isinstance(proc, LoRAIPAttnProcessor):
+                proc.scale = scale
 
-        # Move text encoder to device temporarily
-        text_encoder = text_encoder.to(self.device)
-
-        prompt = "a high quality, detailed, photorealistic face"
-        neg_prompt = (
-            "monochrome, lowres, bad anatomy, worst quality, low quality, "
-            "blurry, deformed, disfigured, extra limbs, missing limbs"
-        )
-
-        with torch.no_grad():
-            tok = tokenizer(
-                prompt, padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True, return_tensors="pt",
-            )
-            self._prompt_embeds = text_encoder(tok.input_ids.to(self.device))[0]
-
-            tok_neg = tokenizer(
-                neg_prompt, padding="max_length",
-                max_length=tokenizer.model_max_length,
-                truncation=True, return_tensors="pt",
-            )
-            self._neg_prompt_embeds = text_encoder(tok_neg.input_ids.to(self.device))[0]
-
-        # Move text encoder back to CPU to free VRAM
-        text_encoder = text_encoder.to("cpu")
-        torch.cuda.empty_cache() if self.device.type == "cuda" else None
+    @torch.inference_mode()
+    def get_image_embeds(
+        self, faceid_embeds: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project face embedding and create unconditional (zero) embedding."""
+        faceid_embeds = faceid_embeds.to(self.device, dtype=self.dtype)
+        image_prompt_embeds = self.image_proj_model(faceid_embeds)
+        uncond_image_prompt_embeds = self.image_proj_model(torch.zeros_like(faceid_embeds))
+        return image_prompt_embeds, uncond_image_prompt_embeds
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -366,7 +491,7 @@ class FaceSwapper:
         source_embedding: np.ndarray,
         mask: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Run face swap on a 512x512 crop.
+        """Run face swap on a crop using img2img.
 
         Parameters
         ----------
@@ -386,23 +511,37 @@ class FaceSwapper:
         crop_rgb = cv2.cvtColor(target_crop, cv2.COLOR_BGR2RGB)
         crop_pil = Image.fromarray(crop_rgb).resize((512, 512), Image.LANCZOS)
 
-        # Project face embedding
-        emb = torch.from_numpy(source_embedding).unsqueeze(0).to(self.device, dtype=self.dtype)
-        with torch.no_grad():
-            face_tokens = self.image_proj_model(emb)  # (1, 4, 768)
+        # Get face embeddings
+        emb = torch.from_numpy(source_embedding).unsqueeze(0)
+        image_prompt_embeds, uncond_image_prompt_embeds = self.get_image_embeds(emb)
 
-        # Concatenate face tokens with text prompt embeddings
-        prompt_embeds = torch.cat([self._prompt_embeds, face_tokens], dim=1)
-        # For negative prompt, pad with zeros
-        neg_pad = torch.zeros_like(face_tokens)
-        neg_prompt_embeds = torch.cat([self._neg_prompt_embeds, neg_pad], dim=1)
+        # Encode text prompts
+        prompt = "a high quality, detailed, photorealistic face"
+        neg_prompt = (
+            "monochrome, lowres, bad anatomy, worst quality, low quality, "
+            "blurry, deformed, disfigured, extra limbs, missing limbs"
+        )
+
+        with torch.inference_mode():
+            prompt_embeds_, negative_prompt_embeds_ = self.pipe.encode_prompt(
+                prompt,
+                device=self.device,
+                num_images_per_prompt=1,
+                do_classifier_free_guidance=True,
+                negative_prompt=neg_prompt,
+            )
+            # Concatenate face tokens with text prompt embeddings
+            prompt_embeds = torch.cat([prompt_embeds_, image_prompt_embeds], dim=1)
+            negative_prompt_embeds = torch.cat(
+                [negative_prompt_embeds_, uncond_image_prompt_embeds], dim=1
+            )
 
         # Run img2img
-        with torch.no_grad():
+        with torch.inference_mode():
             result = self.pipe(
                 image=crop_pil,
                 prompt_embeds=prompt_embeds,
-                negative_prompt_embeds=neg_prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
                 num_inference_steps=self.steps,
                 guidance_scale=self.guidance_scale,
                 strength=self.strength,
@@ -502,13 +641,10 @@ class FaceSwapper:
             lm = getattr(face, "landmark_2d_68", None)
 
         if lm is not None:
-            # Offset landmarks to crop coordinates
             pts = lm.copy()
             pts[:, 0] -= ox
             pts[:, 1] -= oy
             pts = pts.astype(np.int32)
-
-            # Convex hull
             hull = cv2.convexHull(pts)
             cv2.fillConvexPoly(mask, hull, 1.0)
         else:
@@ -521,10 +657,8 @@ class FaceSwapper:
             rh = (by2 - by1) // 2
             cv2.ellipse(mask, (cx, cy), (rw, rh), 0, 0, 360, 1.0, -1)
 
-        # Dilate
         if dilate_iters > 0:
             mask = binary_dilation(mask > 0.5, iterations=dilate_iters).astype(np.float32)
 
-        # Gaussian blur for soft edges
         mask = cv2.GaussianBlur(mask, blur_kernel, 0)
         return mask
