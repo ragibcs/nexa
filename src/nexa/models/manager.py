@@ -10,11 +10,11 @@ MODELS = {
         "ext": ".onnx",
     },
     "simswap_512_unofficial": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/simswap_512_unofficial.onnx",
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/simswap_unofficial_512.onnx",
         "ext": ".onnx",
     },
     "ghost_256": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/ghost_256.onnx",
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/ghost_1_256.onnx",
         "ext": ".onnx",
     },
     "blendswap_256": {
