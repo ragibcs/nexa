@@ -72,13 +72,10 @@ def ensure_hf_models():
     # Make sure we don't symlink in cache (can cause issues with some diffusers loaders)
     os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 
-    log_info("Ensuring HuggingFace Diffusers models are downloaded (this may take a while on first run)...")
+    log_info("Ensuring HuggingFace models are downloaded (this may take a while on first run)...")
 
-    # 1. Base model (SD1.5 Realistic Vision) is handled by from_pretrained
+    # 1. Base model (SD1.5) is handled by from_pretrained
 
     # 2. IP-Adapter FaceID
     snapshot_download(repo_id="h94/IP-Adapter-FaceID", allow_patterns=["*.bin", "*.safetensors", "*.json"])
-
-    # 3. LCM LoRA for SD1.5
-    snapshot_download(repo_id="latent-consistency/lcm-lora-sdv1-5", allow_patterns=["*.safetensors"])
 

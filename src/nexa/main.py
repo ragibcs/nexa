@@ -39,12 +39,12 @@ def swap(
     ] = None,
     model: Annotated[
         str,
-        typer.Option("--model", "-M", help="Base Stable Diffusion 1.5 model ID from HuggingFace (e.g. SG161222/Realistic_Vision_V5.1_noVAE)"),
-    ] = "SG161222/Realistic_Vision_V5.1_noVAE",
+        typer.Option("--model", "-M", help="Base Stable Diffusion 1.5 model ID from HuggingFace"),
+    ] = "runwayml/stable-diffusion-v1-5",
     steps: Annotated[
         int,
-        typer.Option("--steps", help="Number of diffusion inference steps (LCM enables 4-8 steps)"),
-    ] = 4,
+        typer.Option("--steps", help="Number of diffusion inference steps (15-30 recommended)"),
+    ] = 20,
     enhancer: Annotated[
         Optional[str],
         typer.Option("--enhancer", "-e", help="Face enhancer: gfpgan | codeformer"),
