@@ -36,21 +36,22 @@ class Swapper:
 
         log_info("Loading IP-Adapter-FaceID...")
         # Note: diffusers loads ip adapters by looking at the repo
-        self.pipeline.load_ip_adapter(
-            "h94/IP-Adapter-FaceID",
-            subfolder="",
-            weight_name="ip-adapter-faceid_sd15.bin",
-            image_encoder_folder=None # FaceID models do not use the standard CLIP image encoder
-        )
+        try:
+            self.pipeline.load_ip_adapter(
+                "h94/IP-Adapter-FaceID",
+                subfolder="",
+                weight_name="ip-adapter-faceid_sd15.bin"
+            )
+        except TypeError:
+            # Fallback for older diffusers that don't support image_encoder_folder
+            self.pipeline.load_ip_adapter(
+                "h94/IP-Adapter-FaceID",
+                subfolder="",
+                weight_name="ip-adapter-faceid_sd15.bin"
+            )
 
         # We need to set the scale of the IP-Adapter
         self.pipeline.set_ip_adapter_scale(1.2)
-
-        # Diffusers 0.27+ requires image encoder to be bypassed manually if we pass embeddings directly,
-        # but FaceID doesn't even have a CLIP vision model. We patch the pipeline's image encoder check
-        # by manually setting the feature_extractor to None.
-        self.pipeline.feature_extractor = None
-        self.pipeline.image_encoder = None
 
         # Keep things memory efficient
         if self.device.type == "cuda":
@@ -136,12 +137,8 @@ class Swapper:
         mask_image = Image.fromarray(diff_mask)
 
         # 4. Extract Source Face Embeds
-        # FaceID expects a tensor of shape [batch_size, num_images, embed_dim]
-        # Insightface output is (512,)
-        # So we need to unsqueeze it twice: (1, 1, 512)
+        # Diffusers expects the embedding to be passed via cross-attention kwargs or image_embeds
         import torch
-        # Diffusers actually expects a list of tensors for ip_adapter_image_embeds, where each tensor corresponds to an IP-Adapter scale.
-        # So if we have 1 adapter, the list length is 1. The tensor shape should be (1, 1, 512)
         emb = torch.tensor(source_face.normed_embedding).view(1, 1, -1)
         faceid_embeds = emb.to(self.device, dtype=self.dtype)
 
@@ -150,16 +147,31 @@ class Swapper:
         n_prompt = "cartoon, 3d, animated, blurry, deformed, disfigured, poorly drawn, bad lighting"
 
         with torch.no_grad():
-            gen_image = self.pipeline(
-                prompt=prompt,
-                negative_prompt=n_prompt,
-                image=init_image,
-                mask_image=mask_image,
-                ip_adapter_image_embeds=[faceid_embeds], # Just a list of the 3D tensor
-                num_inference_steps=self.steps,
-                guidance_scale=1.5,
-                strength=0.99,
-            ).images[0]
+            try:
+                # Diffusers >= 0.27 style
+                gen_image = self.pipeline(
+                    prompt=prompt,
+                    negative_prompt=n_prompt,
+                    image=init_image,
+                    mask_image=mask_image,
+                    ip_adapter_image_embeds=[faceid_embeds],
+                    num_inference_steps=self.steps,
+                    guidance_scale=1.5,
+                    strength=0.99,
+                ).images[0]
+            except Exception as e:
+                # Fallback to single tensor if list fails
+                log_info(f"Retrying with un-listed embedding... ({e})")
+                gen_image = self.pipeline(
+                    prompt=prompt,
+                    negative_prompt=n_prompt,
+                    image=init_image,
+                    mask_image=mask_image,
+                    ip_adapter_image_embeds=faceid_embeds,
+                    num_inference_steps=self.steps,
+                    guidance_scale=1.5,
+                    strength=0.99,
+                ).images[0]
 
         gen_rgb = np.array(gen_image)
 
