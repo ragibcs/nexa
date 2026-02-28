@@ -20,6 +20,7 @@ def process_media(
     target_path: Path,
     output_path: Path,
     mappings: list,
+    model_name: str,
     enhancer: Optional[str],
     use_gpu: bool = False,
     similarity_threshold: float = 0.6,
@@ -34,7 +35,7 @@ def process_media(
     log_info("Initialising models ...")
     analyzer = FaceAnalyzer(use_gpu=use_gpu)
     mapper = FaceMapper(analyzer, mappings, threshold=similarity_threshold)
-    swapper = Swapper(use_gpu=use_gpu)
+    swapper = Swapper(model_name=model_name, use_gpu=use_gpu)
 
     face_enhancer = None
     if enhancer:

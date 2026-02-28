@@ -37,6 +37,10 @@ def swap(
         Optional[list[str]],
         typer.Option("--map", "-m", help="Multi-face mapping  src.jpg:tgt.jpg  (repeatable)"),
     ] = None,
+    model: Annotated[
+        str,
+        typer.Option("--model", "-M", help="Face swapper model: inswapper_128 | simswap_512_unofficial | ghost_256 | blendswap_256 | uniface_256"),
+    ] = "simswap_512_unofficial",
     enhancer: Annotated[
         Optional[str],
         typer.Option("--enhancer", "-e", help="Face enhancer: gfpgan | codeformer"),
@@ -82,6 +86,7 @@ def swap(
 
     log_info(f"Target  : {target}")
     log_info(f"Output  : {output}")
+    log_info(f"Model   : {model}")
     log_info(f"GPU     : {'yes' if gpu else 'no'}")
     if enhancer:
         log_info(f"Enhancer: {enhancer}")
@@ -93,6 +98,7 @@ def swap(
             target_path=target,
             output_path=output,
             mappings=mappings,
+            model_name=model,
             enhancer=enhancer,
             use_gpu=gpu,
             similarity_threshold=threshold,

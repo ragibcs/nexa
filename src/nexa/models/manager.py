@@ -9,6 +9,22 @@ MODELS = {
         "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
         "ext": ".onnx",
     },
+    "simswap_512_unofficial": {
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/simswap_512_unofficial.onnx",
+        "ext": ".onnx",
+    },
+    "ghost_256": {
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/ghost_256.onnx",
+        "ext": ".onnx",
+    },
+    "blendswap_256": {
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/blendswap_256.onnx",
+        "ext": ".onnx",
+    },
+    "uniface_256": {
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/uniface_256.onnx",
+        "ext": ".onnx",
+    },
     "gfpgan_1.4": {
         "url": "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
         "ext": ".pth",
