@@ -35,27 +35,36 @@ class Swapper:
         self.pipeline.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
 
         log_info("Loading IP-Adapter-FaceID...")
-        # Note: diffusers loads ip adapters by looking at the repo
         try:
+            # The ONLY way to safely bypass the image_encoder check in buggy diffusers versions
+            # is to use the `weight_name` but pass the repo directory specifically.
             self.pipeline.load_ip_adapter(
                 "h94/IP-Adapter-FaceID",
-                subfolder="",
                 weight_name="ip-adapter-faceid_sd15.bin"
             )
-        except Exception:
-            # Fallback for diffusers versions that struggle with custom names in the root folder
-            # It expects `pytorch_model.bin` or `model.safetensors` by default if weight_name has issues
+        except Exception as e:
+            log_info(f"Diffusers load_ip_adapter failed... ({e})")
+
+            # The most bulletproof way across all diffusers versions for FaceID:
+            # We download the model manually, then load it using the exact local directory path
+            # and specify the weight name explicitly.
+            from huggingface_hub import hf_hub_download
+            ckpt_path = hf_hub_download(repo_id="h94/IP-Adapter-FaceID", filename="ip-adapter-faceid_sd15.bin")
+
+            local_dir = os.path.dirname(ckpt_path)
+
             try:
                 self.pipeline.load_ip_adapter(
-                    "h94/IP-Adapter-FaceID",
-                    subfolder=None,
+                    local_dir,
+                    subfolder="",
                     weight_name="ip-adapter-faceid_sd15.bin"
                 )
-            except Exception as e:
-                log_info(f"Downloading weights manually to bypass diffusers cache bug... ({e})")
-                from huggingface_hub import hf_hub_download
-                ckpt_path = hf_hub_download(repo_id="h94/IP-Adapter-FaceID", filename="ip-adapter-faceid_sd15.bin")
-                self.pipeline.load_ip_adapter(os.path.dirname(ckpt_path), subfolder="", weight_name=os.path.basename(ckpt_path))
+            except Exception as e2:
+                # If it still fails, we have to inject the state dict completely manually
+                log_info(f"Local diffusers loader failed, manually injecting state dict... ({e2})")
+                state_dict = torch.load(ckpt_path, map_location="cpu")
+                self.pipeline.unet._load_ip_adapter_weights(state_dict)
+                self.pipeline.image_proj_model = getattr(self.pipeline.unet.encoder_hid_proj, "image_projection_layers", [self.pipeline.unet.encoder_hid_proj])[0]
 
         # We need to set the scale of the IP-Adapter
         self.pipeline.set_ip_adapter_scale(1.2)
