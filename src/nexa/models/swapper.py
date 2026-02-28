@@ -176,14 +176,14 @@ class Swapper:
                     strength=0.99,
                 ).images[0]
             except Exception as e:
-                # Fallback to single tensor if list fails
-                log_info(f"Retrying with un-listed embedding... ({e})")
+                # Some older diffusers versions literally require a list of lists of tensors: [[tensor]]
+                log_info(f"Retrying with double-listed embedding... ({e})")
                 gen_image = self.pipeline(
                     prompt=prompt,
                     negative_prompt=n_prompt,
                     image=init_image,
                     mask_image=mask_image,
-                    ip_adapter_image_embeds=faceid_embeds,
+                    ip_adapter_image_embeds=[[faceid_embeds]],
                     num_inference_steps=self.steps,
                     guidance_scale=1.5,
                     strength=0.99,
