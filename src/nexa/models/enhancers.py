@@ -25,6 +25,14 @@ class FaceEnhancer:
             )
 
     def _load_gfpgan(self):
+        # Workaround for older gfpgan expecting torchvision.transforms.functional_tensor
+        import sys
+        try:
+            import torchvision.transforms.functional as functional
+            sys.modules["torchvision.transforms.functional_tensor"] = functional
+        except ImportError:
+            pass
+
         try:
             from gfpgan import GFPGANer
         except ImportError:
