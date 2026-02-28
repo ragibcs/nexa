@@ -5,6 +5,7 @@ import cv2
 from PIL import Image
 
 from diffusers import StableDiffusionInpaintPipeline, LCMScheduler
+from huggingface_hub import hf_hub_download
 from nexa.models.manager import ensure_hf_models
 from nexa.utils.logging import log_info
 
@@ -13,6 +14,7 @@ class Swapper:
     def __init__(self, model_id: str = "SG161222/Realistic_Vision_V5.1_noVAE", use_gpu: bool = False, steps: int = 4):
         """
         Initializes the IP-Adapter FaceID Diffusion Pipeline with LCM for fast inference.
+        Uses the official ip_adapter package for reliable FaceID weight loading.
         """
         self.device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         self.dtype = torch.float16 if self.device.type == "cuda" else torch.float32
@@ -22,8 +24,6 @@ class Swapper:
         ensure_hf_models()
 
         log_info(f"Loading Base SD1.5 Inpainting Pipeline from '{model_id}'...")
-        # Since standard models don't have inpainting natively mapped sometimes, we just load
-        # the standard weights into an Inpaint Pipeline, it handles it gracefully for img2img inpainting
         self.pipeline = StableDiffusionInpaintPipeline.from_pretrained(
             model_id,
             torch_dtype=self.dtype,
@@ -33,41 +33,14 @@ class Swapper:
         log_info("Applying LCM LoRA for 4-step rapid inference...")
         self.pipeline.scheduler = LCMScheduler.from_config(self.pipeline.scheduler.config)
         self.pipeline.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
+        # Fuse LoRA into base model weights so IP-Adapter attention processors don't conflict
+        self.pipeline.fuse_lora()
 
-        log_info("Loading IP-Adapter-FaceID...")
-        try:
-            # The ONLY way to safely bypass the image_encoder check in buggy diffusers versions
-            # is to use the `weight_name` but pass the repo directory specifically.
-            self.pipeline.load_ip_adapter(
-                "h94/IP-Adapter-FaceID",
-                weight_name="ip-adapter-faceid_sd15.bin"
-            )
-        except Exception as e:
-            log_info(f"Diffusers load_ip_adapter failed... ({e})")
+        log_info("Loading IP-Adapter-FaceID via ip_adapter package...")
+        ip_ckpt = hf_hub_download(repo_id="h94/IP-Adapter-FaceID", filename="ip-adapter-faceid_sd15.bin")
 
-            # The most bulletproof way across all diffusers versions for FaceID:
-            # We download the model manually, then load it using the exact local directory path
-            # and specify the weight name explicitly.
-            from huggingface_hub import hf_hub_download
-            ckpt_path = hf_hub_download(repo_id="h94/IP-Adapter-FaceID", filename="ip-adapter-faceid_sd15.bin")
-
-            local_dir = os.path.dirname(ckpt_path)
-
-            try:
-                self.pipeline.load_ip_adapter(
-                    local_dir,
-                    subfolder="",
-                    weight_name="ip-adapter-faceid_sd15.bin"
-                )
-            except Exception as e2:
-                # If it still fails, we have to inject the state dict completely manually
-                log_info(f"Local diffusers loader failed, manually injecting state dict... ({e2})")
-                state_dict = torch.load(ckpt_path, map_location="cpu")
-                self.pipeline.unet._load_ip_adapter_weights(state_dict)
-                self.pipeline.image_proj_model = getattr(self.pipeline.unet.encoder_hid_proj, "image_projection_layers", [self.pipeline.unet.encoder_hid_proj])[0]
-
-        # We need to set the scale of the IP-Adapter
-        self.pipeline.set_ip_adapter_scale(1.2)
+        from ip_adapter.ip_adapter_faceid import IPAdapterFaceID
+        self.ip_model = IPAdapterFaceID(self.pipeline, ip_ckpt, self.device, self.dtype)
 
         # Keep things memory efficient
         if self.device.type == "cuda":
@@ -99,8 +72,8 @@ class Swapper:
     def swap(self, img: np.ndarray, source_face, target_face) -> np.ndarray:
         """
         Diffusion-based Face Swap.
-        Uses StableDiffusionInpaintPipeline with IP-Adapter-FaceID to generate a new face
-        that exactly matches the source identity, and blends it into the original image.
+        Uses IP-Adapter-FaceID to generate a new face that matches the source identity,
+        and blends it into the original image via inpainting.
         """
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
@@ -116,13 +89,10 @@ class Swapper:
         crop_512 = cv2.resize(crop_rgb, (512, 512), interpolation=cv2.INTER_LANCZOS4)
 
         # 2. Create Inpainting Mask (White for the face we want to replace, Black for background)
-        # We use the target_face landmarks to draw a tight polygon around the face features
         mask_512 = np.zeros((512, 512), dtype=np.uint8)
 
-        # Get facial landmarks relative to the cropped 512x512 image
         kps = target_face.landmark_2d_106 if hasattr(target_face, 'landmark_2d_106') else target_face.kps
         if kps is not None:
-            # Shift kps to crop coordinates, then scale to 512
             kps_shifted = []
             for pt in kps:
                 px = (pt[0] - x1) * (512.0 / orig_crop_w)
@@ -131,20 +101,16 @@ class Swapper:
 
             kps_shifted = np.array(kps_shifted, dtype=np.int32)
 
-            # Draw convex hull around the face landmarks to define the inpainting region
             hull = cv2.convexHull(kps_shifted)
             cv2.fillConvexPoly(mask_512, hull, 255)
 
-            # Dilate and blur the mask heavily so the diffusion model has freedom to generate new borders
             kernel = np.ones((15, 15), np.uint8)
             mask_512 = cv2.dilate(mask_512, kernel, iterations=2)
             mask_512 = cv2.GaussianBlur(mask_512, (51, 51), 0)
         else:
-            # Fallback if no 106 kps available, just do a center circle
             cv2.circle(mask_512, (256, 256), 180, 255, -1)
             mask_512 = cv2.GaussianBlur(mask_512, (51, 51), 0)
 
-        # Threshold to create binary mask for diffusion, but keep a feathered version for compositing later
         composite_mask = mask_512.astype(np.float32) / 255.0
         diff_mask = np.where(mask_512 > 10, 255, 0).astype(np.uint8)
 
@@ -153,48 +119,25 @@ class Swapper:
         mask_image = Image.fromarray(diff_mask)
 
         # 4. Extract Source Face Embeds
-        # Diffusers expects the embedding to be passed via cross-attention kwargs or image_embeds
-        import torch
-        emb = torch.tensor(source_face.normed_embedding).view(1, 1, -1)
-        faceid_embeds = emb.to(self.device, dtype=self.dtype)
+        faceid_embeds = torch.from_numpy(source_face.normed_embedding).unsqueeze(0).to(self.device, dtype=self.dtype)
 
-        # 5. Run Diffusion Pipeline (LCM fast inference)
+        # 5. Run Diffusion Pipeline via IP-Adapter FaceID
         prompt = "photorealistic portrait, highly detailed, sharp focus, exactly same lighting and expression"
         n_prompt = "cartoon, 3d, animated, blurry, deformed, disfigured, poorly drawn, bad lighting"
 
-        with torch.no_grad():
-            try:
-                # Diffusers >= 0.27 style
-                gen_image = self.pipeline(
-                    prompt=prompt,
-                    negative_prompt=n_prompt,
-                    image=init_image,
-                    mask_image=mask_image,
-                    ip_adapter_image_embeds=[faceid_embeds],
-                    num_inference_steps=self.steps,
-                    guidance_scale=1.5,
-                    strength=0.99,
-                ).images[0]
-            except Exception as e:
-                # Diffusers <= 0.25 workaround
-                log_info(f"Retrying with raw tensor embedding... ({e})")
+        images = self.ip_model.generate(
+            prompt=prompt,
+            negative_prompt=n_prompt,
+            faceid_embeds=faceid_embeds,
+            num_samples=1,
+            num_inference_steps=self.steps,
+            guidance_scale=1.5,
+            image=init_image,
+            mask_image=mask_image,
+            strength=0.99,
+        )
 
-                # In some versions, the pipeline actually expects the single tensor, not wrapped in any lists at all
-                if hasattr(self.pipeline, "set_ip_adapter_scale"):
-                    pass # Keep the old try block running just in case
-
-                gen_image = self.pipeline(
-                    prompt=prompt,
-                    negative_prompt=n_prompt,
-                    image=init_image,
-                    mask_image=mask_image,
-                    ip_adapter_image_embeds=faceid_embeds, # No list brackets! Just raw tensor.
-                    num_inference_steps=self.steps,
-                    guidance_scale=1.5,
-                    strength=0.99,
-                ).images[0]
-
-        gen_rgb = np.array(gen_image)
+        gen_rgb = np.array(images[0])
 
         # 6. Composite the generated face back into the original crop using the soft mask
         composite_mask_3d = np.stack([composite_mask]*3, axis=2)
