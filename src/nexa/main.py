@@ -39,8 +39,12 @@ def swap(
     ] = None,
     model: Annotated[
         str,
-        typer.Option("--model", "-M", help="Face swapper model: inswapper_128 | simswap_512_unofficial | ghost_256 | blendswap_256 | uniface_256"),
-    ] = "simswap_512_unofficial",
+        typer.Option("--model", "-M", help="Base Stable Diffusion 1.5 model ID from HuggingFace (e.g. SG161222/Realistic_Vision_V5.1_noVAE)"),
+    ] = "SG161222/Realistic_Vision_V5.1_noVAE",
+    steps: Annotated[
+        int,
+        typer.Option("--steps", help="Number of diffusion inference steps (LCM enables 4-8 steps)"),
+    ] = 4,
     enhancer: Annotated[
         Optional[str],
         typer.Option("--enhancer", "-e", help="Face enhancer: gfpgan | codeformer"),
@@ -87,6 +91,7 @@ def swap(
     log_info(f"Target  : {target}")
     log_info(f"Output  : {output}")
     log_info(f"Model   : {model}")
+    log_info(f"Steps   : {steps}")
     log_info(f"GPU     : {'yes' if gpu else 'no'}")
     if enhancer:
         log_info(f"Enhancer: {enhancer}")
@@ -98,7 +103,8 @@ def swap(
             target_path=target,
             output_path=output,
             mappings=mappings,
-            model_name=model,
+            model_id=model,
+            steps=steps,
             enhancer=enhancer,
             use_gpu=gpu,
             similarity_threshold=threshold,

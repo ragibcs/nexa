@@ -1,12 +1,9 @@
 import insightface
 import numpy as np
 
-from nexa.models.providers import get_providers
-
-
 class FaceAnalyzer:
     def __init__(self, use_gpu: bool = False):
-        providers = get_providers(use_gpu)
+        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
         self.app = insightface.app.FaceAnalysis(name="buffalo_l", providers=providers)
         self.app.prepare(ctx_id=0, det_size=(640, 640))
 

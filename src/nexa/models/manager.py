@@ -1,30 +1,11 @@
 from pathlib import Path
 import urllib.request
 from rich.progress import Progress, BarColumn, DownloadColumn, TransferSpeedColumn, TimeRemainingColumn
+import os
 
 CACHE_DIR = Path.home() / ".cache" / "nexa" / "models"
 
 MODELS = {
-    "inswapper_128": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
-        "ext": ".onnx",
-    },
-    "simswap_512_unofficial": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/simswap_unofficial_512.onnx",
-        "ext": ".onnx",
-    },
-    "ghost_256": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/ghost_1_256.onnx",
-        "ext": ".onnx",
-    },
-    "blendswap_256": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/blendswap_256.onnx",
-        "ext": ".onnx",
-    },
-    "uniface_256": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/uniface_256.onnx",
-        "ext": ".onnx",
-    },
     "gfpgan_1.4": {
         "url": "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
         "ext": ".pth",
@@ -82,3 +63,22 @@ def download_model(name: str) -> Path:
 
 def get_model_path(name: str) -> Path:
     return download_model(name)
+
+def ensure_hf_models():
+    """Ensure HuggingFace models for IP-Adapter FaceID and LCM are cached."""
+    from huggingface_hub import snapshot_download
+    from nexa.utils.logging import log_info
+
+    # Make sure we don't symlink in cache (can cause issues with some diffusers loaders)
+    os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+
+    log_info("Ensuring HuggingFace Diffusers models are downloaded (this may take a while on first run)...")
+
+    # 1. Base model (SD1.5 Realistic Vision) is handled by from_pretrained
+
+    # 2. IP-Adapter FaceID
+    snapshot_download(repo_id="h94/IP-Adapter-FaceID", allow_patterns=["*.bin", "*.safetensors", "*.json"])
+
+    # 3. LCM LoRA for SD1.5
+    snapshot_download(repo_id="latent-consistency/lcm-lora-sdv1-5", allow_patterns=["*.safetensors"])
+
