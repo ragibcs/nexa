@@ -6,7 +6,7 @@ CACHE_DIR = Path.home() / ".cache" / "nexa" / "models"
 
 MODELS = {
     "inswapper_128": {
-        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models/inswapper_128.onnx",
+        "url": "https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/inswapper_128.onnx",
         "ext": ".onnx",
     },
     "gfpgan_1.4": {
