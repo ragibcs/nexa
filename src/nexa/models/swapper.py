@@ -35,10 +35,12 @@ class Swapper:
         self.pipeline.load_lora_weights("latent-consistency/lcm-lora-sdv1-5")
 
         log_info("Loading IP-Adapter-FaceID...")
+        # Note: diffusers loads ip adapters by looking at the repo
         self.pipeline.load_ip_adapter(
             "h94/IP-Adapter-FaceID",
             subfolder="",
-            weight_name="ip-adapter-faceid_sd15.bin"
+            weight_name="ip-adapter-faceid_sd15.bin",
+            image_encoder_folder=None # FaceID models do not use the standard CLIP image encoder
         )
 
         # We need to set the scale of the IP-Adapter
@@ -85,6 +87,9 @@ class Swapper:
 
         # Resize to standard 512x512 for SD1.5
         orig_crop_h, orig_crop_w = crop_rgb.shape[:2]
+        if orig_crop_h == 0 or orig_crop_w == 0:
+            return cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+
         crop_512 = cv2.resize(crop_rgb, (512, 512), interpolation=cv2.INTER_LANCZOS4)
 
         # 2. Create Inpainting Mask (White for the face we want to replace, Black for background)
@@ -124,8 +129,13 @@ class Swapper:
         init_image = Image.fromarray(crop_512)
         mask_image = Image.fromarray(diff_mask)
 
-        # 4. Extract Source Face Embeds (IP-Adapter FaceID expects a tensor of the InsightFace embedding)
+        # 4. Extract Source Face Embeds
+        # FaceID requires the embedding to be a list of tensors containing the raw embedding
+        # Shape: [1, 512] for InsightFace buffalo_l
         faceid_embeds = torch.from_numpy(source_face.normed_embedding).unsqueeze(0).to(self.device, dtype=self.dtype)
+
+        # In diffusers 0.27.x+, ip_adapter_image_embeds needs to be passed directly as a list of tensors
+        # corresponding to the scales.
 
         # 5. Run Diffusion Pipeline (LCM fast inference)
         prompt = "photorealistic portrait, highly detailed, sharp focus, exactly same lighting and expression"
