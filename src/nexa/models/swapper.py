@@ -176,14 +176,19 @@ class Swapper:
                     strength=0.99,
                 ).images[0]
             except Exception as e:
-                # Some older diffusers versions literally require a list of lists of tensors: [[tensor]]
-                log_info(f"Retrying with double-listed embedding... ({e})")
+                # Diffusers <= 0.25 workaround
+                log_info(f"Retrying with raw tensor embedding... ({e})")
+
+                # In some versions, the pipeline actually expects the single tensor, not wrapped in any lists at all
+                if hasattr(self.pipeline, "set_ip_adapter_scale"):
+                    pass # Keep the old try block running just in case
+
                 gen_image = self.pipeline(
                     prompt=prompt,
                     negative_prompt=n_prompt,
                     image=init_image,
                     mask_image=mask_image,
-                    ip_adapter_image_embeds=[[faceid_embeds]],
+                    ip_adapter_image_embeds=faceid_embeds, # No list brackets! Just raw tensor.
                     num_inference_steps=self.steps,
                     guidance_scale=1.5,
                     strength=0.99,
