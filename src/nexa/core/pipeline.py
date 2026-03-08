@@ -23,7 +23,7 @@ from nexa.core.mapping import FaceMapper
 from nexa.models.analyzer import FaceAnalyzer
 from nexa.models.swapper import FaceSwapper
 from nexa.models.enhancers import get_enhancer
-from nexa.utils.video import is_video, is_image, count_frames, get_fps
+from nexa.utils.video import count_frames, get_fps
 
 console = Console()
 
@@ -45,7 +45,7 @@ class NexaPipeline:
         console.print("[bold cyan]Initializing Nexa Pipeline…[/]")
 
         console.print("[dim]Step 1/3: Loading face analyzer…[/]")
-        self.analyzer = FaceAnalyzer()
+        self.analyzer = FaceAnalyzer(device=device)
 
         console.print("[dim]Step 2/3: Loading face swapper…[/]")
         self.swapper = FaceSwapper(
@@ -96,7 +96,8 @@ class NexaPipeline:
         tgt_faces = self.analyzer.detect(target_img)
         if not tgt_faces:
             console.print("[yellow]No faces detected in target — copying as-is.[/]")
-            cv2.imwrite(str(output_path), target_img)
+            if not cv2.imwrite(str(output_path), target_img):
+                raise RuntimeError(f"Failed to write output image: {output_path}")
             return Path(output_path)
         console.print(f"[dim]Found {len(tgt_faces)} face(s) in target.[/]")
 
@@ -119,7 +120,8 @@ class NexaPipeline:
             except Exception as e:
                 console.print(f"[yellow]Enhancement failed: {e}[/]")
 
-        cv2.imwrite(str(output_path), result)
+        if not cv2.imwrite(str(output_path), result):
+            raise RuntimeError(f"Failed to write output image: {output_path}")
         console.print(f"[bold green]Saved:[/] {output_path}")
         return Path(output_path)
 
@@ -137,7 +139,9 @@ class NexaPipeline:
         if target_img is None:
             raise FileNotFoundError(f"Cannot read target: {target_path}")
 
-        # Register sources
+        # Build source/reference pairs where reference embedding is only used
+        # for matching and source embedding is used for swapping.
+        source_refs: list[tuple[str, np.ndarray, np.ndarray]] = []
         for src_path, ref_path in mappings.items():
             src_img = cv2.imread(str(src_path))
             ref_img = cv2.imread(str(ref_path))
@@ -153,31 +157,53 @@ class NexaPipeline:
             if not ref_faces:
                 raise RuntimeError(f"No face in reference: {ref_path}")
 
-            self.mapper.add_source(str(src_path), self.analyzer.embedding(src_faces[0]))
-            self.mapper.add_source(
-                f"_ref_{ref_path}",
-                self.analyzer.embedding(ref_faces[0]),
+            source_refs.append(
+                (
+                    str(src_path),
+                    self.analyzer.embedding(src_faces[0]),
+                    self.analyzer.embedding(ref_faces[0]),
+                )
             )
 
         # Detect target faces
         tgt_faces = self.analyzer.detect(target_img)
         if not tgt_faces:
             console.print("[yellow]No faces in target.[/]")
-            cv2.imwrite(str(output_path), target_img)
+            if not cv2.imwrite(str(output_path), target_img):
+                raise RuntimeError(f"Failed to write output image: {output_path}")
             return Path(output_path)
 
-        # Match and swap
+        # Match each target face to the closest reference identity, then swap
+        # using that identity's source embedding.
         result = target_img.copy()
-        match_map = self.mapper.match_multi(tgt_faces)
-        for face_idx, (src_name, src_emb, sim) in match_map.items():
-            result = self.swapper.swap_face_in_image(
-                result, tgt_faces[face_idx], src_emb
+        for face_idx, tgt_face in enumerate(tgt_faces):
+            best_name: str | None = None
+            best_src_emb: np.ndarray | None = None
+            best_sim = -1.0
+
+            for src_name, src_emb, ref_emb in source_refs:
+                sim = float(np.dot(ref_emb, tgt_face.normed_embedding))
+                if sim > best_sim:
+                    best_sim = sim
+                    best_name = src_name
+                    best_src_emb = src_emb
+
+            if best_src_emb is None or best_sim < self.mapper.threshold:
+                console.print(
+                    f"[dim]Face {face_idx} skipped (best similarity={best_sim:.3f}).[/]"
+                )
+                continue
+
+            console.print(
+                f"[dim]Face {face_idx} → {best_name} (similarity={best_sim:.3f})[/]"
             )
+            result = self.swapper.swap_face_in_image(result, tgt_face, best_src_emb)
 
         if self.enhancer is not None:
             result = self.enhancer.enhance(result)
 
-        cv2.imwrite(str(output_path), result)
+        if not cv2.imwrite(str(output_path), result):
+            raise RuntimeError(f"Failed to write output image: {output_path}")
         console.print(f"[bold green]Saved:[/] {output_path}")
         return Path(output_path)
 
@@ -207,59 +233,65 @@ class NexaPipeline:
         total = count_frames(target_path)
         console.print(f"[dim]Video: {total} frames @ {fps:.1f} FPS[/]")
 
-        # Extract audio
+        # Extract audio and process frames
         tmp_dir = Path(tempfile.mkdtemp(prefix="nexa_"))
-        audio_file = tmp_dir / "audio.aac"
-        has_audio = extract_audio(target_path, audio_file)
+        try:
+            audio_file = tmp_dir / "audio.aac"
+            has_audio = extract_audio(target_path, audio_file)
 
-        # Process frames
-        tmp_video = tmp_dir / "video_noaudio.mp4"
-        writer = iio.imopen(str(tmp_video), "w", plugin="pyav")
-        writer.init_video_stream("libx264", fps=fps)
+            tmp_video = tmp_dir / "video_noaudio.mp4"
+            writer = None
+            try:
+                writer = iio.imopen(str(tmp_video), "w", plugin="pyav")
+                writer.init_video_stream("libx264", fps=fps)
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("{task.completed}/{task.total}"),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task = progress.add_task("Swapping faces", total=total)
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TextColumn("{task.completed}/{task.total}"),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("Swapping faces", total=total)
 
-            for frame in iio.imiter(str(target_path), plugin="pyav"):
-                frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+                    for frame_idx, frame in enumerate(iio.imiter(str(target_path), plugin="pyav")):
+                        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
-                faces = self.analyzer.detect(frame_bgr)
-                if faces:
-                    for face in faces:
-                        try:
-                            frame_bgr = self.swapper.swap_face_in_image(
-                                frame_bgr, face, src_emb
-                            )
-                        except Exception:
-                            pass  # Skip failed frames silently
+                        faces = self.analyzer.detect(frame_bgr)
+                        if faces:
+                            for face_idx, face in enumerate(faces):
+                                try:
+                                    frame_bgr = self.swapper.swap_face_in_image(
+                                        frame_bgr, face, src_emb
+                                    )
+                                except Exception as e:
+                                    console.print(
+                                        f"[yellow]Swap failed at frame {frame_idx}, face {face_idx}: {e}[/]"
+                                    )
 
-                    if self.enhancer is not None:
-                        try:
-                            frame_bgr = self.enhancer.enhance(frame_bgr)
-                        except Exception:
-                            pass
+                            if self.enhancer is not None:
+                                try:
+                                    frame_bgr = self.enhancer.enhance(frame_bgr)
+                                except Exception as e:
+                                    console.print(
+                                        f"[yellow]Enhancer failed at frame {frame_idx}: {e}[/]"
+                                    )
 
-                frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                writer.write_frame(frame_rgb)
-                progress.advance(task)
+                        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+                        writer.write_frame(frame_rgb)
+                        progress.advance(task)
+            finally:
+                if writer is not None:
+                    writer.close()
 
-        writer.close()
+            # Mux audio
+            if has_audio:
+                mux_audio(tmp_video, audio_file, output_path)
+            else:
+                shutil.copy2(tmp_video, output_path)
 
-        # Mux audio
-        if has_audio:
-            mux_audio(tmp_video, audio_file, output_path)
-        else:
-            shutil.copy2(tmp_video, output_path)
-
-        # Cleanup
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-
-        console.print(f"[bold green]Saved:[/] {output_path}")
-        return output_path
+            console.print(f"[bold green]Saved:[/] {output_path}")
+            return output_path
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)

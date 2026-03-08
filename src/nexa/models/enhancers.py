@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
-import cv2
 import numpy as np
 from rich.console import Console
 
@@ -52,29 +50,30 @@ class GFPGANEnhancer:
 
 
 class CodeFormerEnhancer:
-    """Enhance faces using CodeFormer (placeholder — falls back to GFPGAN
-    if CodeFormer dependencies are not installed)."""
+    """Temporary CodeFormer wrapper.
+
+    Until native CodeFormer processing is implemented, this enhancer always
+    falls back to GFPGAN to avoid silently returning the input image unchanged.
+    """
 
     def __init__(self) -> None:
         _patch_torchvision()
         try:
-            # CodeFormer requires its own repo; fall back to GFPGAN if unavailable
             from codeformer.facelib.utils.face_restoration_helper import FaceRestoreHelper  # noqa: F401
             model_path = download_codeformer()
-            console.print(f"[bold green]Loading CodeFormer[/] from {model_path}")
-            # Full CodeFormer integration would go here
-            self._fallback = None
+            console.print(f"[bold yellow]CodeFormer weights found[/] at {model_path}")
+            console.print(
+                "[yellow]CodeFormer inference is not implemented yet — using GFPGAN fallback.[/]"
+            )
         except ImportError:
             console.print(
                 "[yellow]CodeFormer not available — falling back to GFPGAN.[/]"
             )
-            self._fallback = GFPGANEnhancer()
+
+        self._fallback = GFPGANEnhancer()
 
     def enhance(self, image: np.ndarray) -> np.ndarray:
-        if self._fallback is not None:
-            return self._fallback.enhance(image)
-        # CodeFormer processing would go here
-        return image
+        return self._fallback.enhance(image)
 
 
 def get_enhancer(name: str | None):

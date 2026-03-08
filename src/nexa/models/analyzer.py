@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
 from rich.console import Console
@@ -13,14 +12,23 @@ console = Console()
 class FaceAnalyzer:
     """Wrapper around InsightFace ``buffalo_l`` for detection and embedding."""
 
-    def __init__(self, det_size: tuple[int, int] = (640, 640)) -> None:
+    def __init__(
+        self,
+        det_size: tuple[int, int] = (640, 640),
+        device: str = "cuda",
+    ) -> None:
         console.print("[bold green]Loading InsightFace buffalo_l …[/]")
-        # CPU provider is fine — InsightFace detection is fast enough on CPU
-        self.app = FaceAnalysis(
-            name="buffalo_l",
-            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+
+        use_cuda = device.startswith("cuda")
+        providers = (
+            ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            if use_cuda
+            else ["CPUExecutionProvider"]
         )
-        self.app.prepare(ctx_id=0, det_size=det_size)
+        ctx_id = 0 if use_cuda else -1
+
+        self.app = FaceAnalysis(name="buffalo_l", providers=providers)
+        self.app.prepare(ctx_id=ctx_id, det_size=det_size)
         console.print("[green]InsightFace ready.[/]")
 
     # ── public API ────────────────────────────────────────────────────────────

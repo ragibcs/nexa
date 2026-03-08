@@ -7,7 +7,7 @@
 - **Diffusion-based face swap** using IP-Adapter FaceID (not traditional GAN-based)
 - **Single-face** and **multi-face** mapping modes
 - **Video processing** with audio preservation
-- **Face enhancement** via GFPGAN post-processing
+- **Face enhancement** via GFPGAN post-processing (`codeformer` currently routes to GFPGAN fallback)
 - **Colab-ready** — runs on free T4 GPU (~6-7 GB VRAM)
 - **CLI + Python API** — use from terminal or import in your code
 
@@ -60,7 +60,7 @@ Or use the CLI directly:
 # Single face swap
 nexa --source face.jpg --target photo.jpg --output result.jpg --gpu
 
-# Multi-face mapping
+# Multi-face mapping (source:reference-in-target)
 nexa -m alice.jpg:person1.jpg -m bob.jpg:person2.jpg -t group.jpg -o out.jpg --gpu
 
 # Video processing
@@ -78,15 +78,15 @@ nexa -s face.jpg -t photo.jpg -o result.jpg --gpu \
 | `--source / -s` | None | Source face image (single-face mode) |
 | `--target / -t` | *required* | Target image or video |
 | `--output / -o` | *required* | Output file path |
-| `--map / -m` | None | Multi-face mapping `src.jpg:tgt.jpg` (repeatable) |
+| `--map / -m` | None | Multi-face mapping `source.jpg:reference.jpg` (repeatable) |
 | `--model / -M` | `runwayml/stable-diffusion-v1-5` | HuggingFace SD1.5 model ID |
 | `--steps` | 20 | Diffusion inference steps (15-30 recommended) |
 | `--strength` | 0.65 | How much to change the init image (0=none, 1=full) |
 | `--guidance-scale` | 5.0 | Classifier-free guidance scale |
 | `--ip-scale` | 1.0 | IP-Adapter face identity strength |
-| `--enhancer / -e` | None | Face enhancer: `gfpgan` or `codeformer` |
+| `--enhancer / -e` | None | Face enhancer: `gfpgan` (or `codeformer`, currently using GFPGAN fallback) |
 | `--gpu` | False | Use CUDA acceleration |
-| `--threshold` | 0.6 | Cosine similarity threshold for face matching |
+| `--threshold` | 0.6 | Cosine similarity threshold for multi-face reference matching |
 
 ## Python API
 
@@ -152,6 +152,8 @@ pipeline.process_video("source.jpg", "video.mp4", "output.mp4")
 | **Total** | **~6-7 GB** |
 
 ## Installation (Local)
+
+> Note: dependencies are pinned to `numpy<2` and `onnxruntime<2` for compatibility with the current InsightFace + ONNX runtime stack.
 
 ```bash
 # Clone
