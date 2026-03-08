@@ -506,8 +506,29 @@ class FaceSwapper:
         np.ndarray
             BGR result image at 512x512.
         """
-        # Prepare init image
+        # Prepare init image: preserve aspect ratio by padding to square first,
+        # then resize to 512x512 for SD.
+        orig_h, orig_w = target_crop.shape[:2]
         crop_rgb = cv2.cvtColor(target_crop, cv2.COLOR_BGR2RGB)
+
+        pad_top = pad_bottom = pad_left = pad_right = 0
+        if orig_h != orig_w:
+            side = max(orig_h, orig_w)
+            dh = side - orig_h
+            dw = side - orig_w
+            pad_top = dh // 2
+            pad_bottom = dh - pad_top
+            pad_left = dw // 2
+            pad_right = dw - pad_left
+            crop_rgb = cv2.copyMakeBorder(
+                crop_rgb,
+                pad_top,
+                pad_bottom,
+                pad_left,
+                pad_right,
+                borderType=cv2.BORDER_REFLECT_101,
+            )
+
         crop_pil = Image.fromarray(crop_rgb).resize((512, 512), Image.LANCZOS)
 
         # Get face embeddings
@@ -550,6 +571,15 @@ class FaceSwapper:
         # Convert back to BGR numpy
         result_np = np.array(result)
         result_bgr = cv2.cvtColor(result_np, cv2.COLOR_RGB2BGR)
+
+        # Undo square-padding so returned crop keeps original aspect ratio.
+        if orig_h != orig_w:
+            result_bgr = cv2.resize(result_bgr, (crop_rgb.shape[1], crop_rgb.shape[0]), interpolation=cv2.INTER_LANCZOS4)
+            result_bgr = result_bgr[
+                pad_top: result_bgr.shape[0] - pad_bottom,
+                pad_left: result_bgr.shape[1] - pad_right,
+            ]
+
         return result_bgr
 
     def swap_face_in_image(
@@ -587,15 +617,30 @@ class FaceSwapper:
         bbox = face.bbox.astype(int)
         x1, y1, x2, y2 = bbox
 
-        # Expand bounding box
+        # Expand to a square crop to avoid aspect-ratio warping when resizing
+        # to 512x512 for diffusion.
         bw, bh = x2 - x1, y2 - y1
         cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
-        half_w = int(bw * expand_ratio / 2)
-        half_h = int(bh * expand_ratio / 2)
-        ex1 = max(0, cx - half_w)
-        ey1 = max(0, cy - half_h)
-        ex2 = min(w, cx + half_w)
-        ey2 = min(h, cy + half_h)
+        side = int(max(bw, bh) * expand_ratio)
+        half_side = max(1, side // 2)
+
+        ex1 = max(0, cx - half_side)
+        ey1 = max(0, cy - half_side)
+        ex2 = min(w, cx + half_side)
+        ey2 = min(h, cy + half_side)
+
+        # Keep crop square near image borders by shifting the box back inside.
+        crop_w = ex2 - ex1
+        crop_h = ey2 - ey1
+        if crop_w != crop_h:
+            if crop_w > crop_h:
+                diff = crop_w - crop_h
+                ey1 = max(0, ey1 - diff // 2)
+                ey2 = min(h, ey2 + (diff - diff // 2))
+            else:
+                diff = crop_h - crop_w
+                ex1 = max(0, ex1 - diff // 2)
+                ex2 = min(w, ex2 + (diff - diff // 2))
 
         crop = full_image[ey1:ey2, ex1:ex2].copy()
         crop_h, crop_w = crop.shape[:2]
@@ -611,8 +656,10 @@ class FaceSwapper:
         # Resize swapped back to crop dimensions
         swapped = cv2.resize(swapped, (crop_w, crop_h), interpolation=cv2.INTER_LANCZOS4)
 
-        # Alpha-blend using mask
-        mask_3ch = np.stack([mask] * 3, axis=-1)
+        # Adaptive blend: keep stronger swap in face center and softer edges
+        # to reduce cutout/plastic transitions.
+        adaptive_mask = self._create_adaptive_blend_mask(mask, face, (ex1, ey1), (crop_h, crop_w))
+        mask_3ch = np.stack([adaptive_mask] * 3, axis=-1)
         blended = (swapped.astype(np.float32) * mask_3ch +
                    crop.astype(np.float32) * (1.0 - mask_3ch))
         blended = np.clip(blended, 0, 255).astype(np.uint8)
@@ -621,6 +668,38 @@ class FaceSwapper:
         result = full_image.copy()
         result[ey1:ey2, ex1:ex2] = blended
         return result
+
+    @staticmethod
+    def _create_adaptive_blend_mask(
+        base_mask: np.ndarray,
+        face,
+        crop_offset: tuple[int, int],
+        crop_shape: tuple[int, int],
+    ) -> np.ndarray:
+        """Create a center-weighted blend mask for more natural compositing."""
+        crop_h, crop_w = crop_shape
+        ox, oy = crop_offset
+
+        # Build an elliptical center prior from bbox in crop coordinates.
+        bbox = face.bbox.astype(int)
+        bx1, by1, bx2, by2 = bbox
+        cx = (bx1 + bx2) * 0.5 - ox
+        cy = (by1 + by2) * 0.5 - oy
+        rx = max(1.0, (bx2 - bx1) * 0.38)
+        ry = max(1.0, (by2 - by1) * 0.48)
+
+        yy, xx = np.mgrid[0:crop_h, 0:crop_w]
+        center_prior = 1.0 - (((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2)
+        center_prior = np.clip(center_prior, 0.0, 1.0).astype(np.float32)
+        center_prior = cv2.GaussianBlur(center_prior, (31, 31), 0)
+
+        # Combine with the landmark mask:
+        # - higher blend at center (identity features)
+        # - softer blend at edges (better skin/hair/neck transitions)
+        adaptive = base_mask * (0.45 + 0.55 * center_prior)
+        adaptive = np.clip(adaptive, 0.0, 1.0)
+        adaptive = cv2.GaussianBlur(adaptive, (31, 31), 0)
+        return adaptive
 
     @staticmethod
     def _create_face_mask(

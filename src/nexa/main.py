@@ -45,8 +45,8 @@ def main(
     ] = "runwayml/stable-diffusion-v1-5",
     steps: Annotated[
         int,
-        typer.Option("--steps", help="Diffusion inference steps (15-30 recommended)."),
-    ] = 20,
+        typer.Option("--steps", help="Diffusion inference steps (20-35 recommended)."),
+    ] = 28,
     enhancer: Annotated[
         Optional[str],
         typer.Option("--enhancer", "-e", help="Face enhancer: gfpgan or codeformer."),
@@ -61,12 +61,12 @@ def main(
     ] = 0.6,
     strength: Annotated[
         float,
-        typer.Option("--strength", help="Diffusion strength (0=none, 1=full)."),
-    ] = 0.65,
+        typer.Option("--strength", help="Diffusion strength (lower = more realistic, 0=none, 1=full)."),
+    ] = 0.45,
     guidance_scale: Annotated[
         float,
         typer.Option("--guidance-scale", help="Classifier-free guidance scale."),
-    ] = 5.0,
+    ] = 4.0,
     ip_scale: Annotated[
         float,
         typer.Option("--ip-scale", help="IP-Adapter face identity strength."),
