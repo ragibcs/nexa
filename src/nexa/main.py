@@ -46,7 +46,7 @@ def main(
     steps: Annotated[
         int,
         typer.Option("--steps", help="Diffusion inference steps (20-35 recommended)."),
-    ] = 28,
+    ] = 24,
     enhancer: Annotated[
         Optional[str],
         typer.Option("--enhancer", "-e", help="Face enhancer: gfpgan or codeformer."),
@@ -62,15 +62,23 @@ def main(
     strength: Annotated[
         float,
         typer.Option("--strength", help="Diffusion strength (lower = more realistic, 0=none, 1=full)."),
-    ] = 0.45,
+    ] = 0.35,
     guidance_scale: Annotated[
         float,
         typer.Option("--guidance-scale", help="Classifier-free guidance scale."),
-    ] = 4.0,
+    ] = 3.2,
     ip_scale: Annotated[
         float,
         typer.Option("--ip-scale", help="IP-Adapter face identity strength."),
-    ] = 1.0,
+    ] = 0.8,
+    det_size: Annotated[
+        int,
+        typer.Option("--det-size", help="InsightFace detection size (e.g. 512, 640, 768)."),
+    ] = 640,
+    det_score: Annotated[
+        float,
+        typer.Option("--det-score", help="InsightFace detection score threshold."),
+    ] = 0.45,
 ) -> None:
     """Run Nexa face swap."""
     setup_logging()
@@ -85,6 +93,8 @@ def main(
     console.print(f"  Strength : {strength}")
     console.print(f"  Guidance : {guidance_scale}")
     console.print(f"  IP Scale : {ip_scale}")
+    console.print(f"  Det Size : {det_size}")
+    console.print(f"  Det Score: {det_score}")
     console.print(f"  Enhancer : {enhancer or 'none'}")
     console.print()
 
@@ -109,6 +119,8 @@ def main(
         ip_scale=ip_scale,
         strength=strength,
         guidance_scale=guidance_scale,
+        det_size=det_size,
+        det_score=det_score,
     )
 
     if map:

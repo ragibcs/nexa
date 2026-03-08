@@ -41,11 +41,17 @@ class NexaPipeline:
         ip_scale: float = 1.0,
         strength: float = 0.65,
         guidance_scale: float = 5.0,
+        det_size: int = 640,
+        det_score: float = 0.45,
     ) -> None:
         console.print("[bold cyan]Initializing Nexa Pipeline…[/]")
 
         console.print("[dim]Step 1/3: Loading face analyzer…[/]")
-        self.analyzer = FaceAnalyzer(device=device)
+        self.analyzer = FaceAnalyzer(
+            device=device,
+            det_size=(det_size, det_size),
+            det_score=det_score,
+        )
 
         console.print("[dim]Step 2/3: Loading face swapper…[/]")
         self.swapper = FaceSwapper(
@@ -89,7 +95,8 @@ class NexaPipeline:
         if not src_faces:
             raise RuntimeError(f"No face detected in source: {source_path}")
         console.print(f"[dim]Found {len(src_faces)} face(s) in source.[/]")
-        src_emb = self.analyzer.embedding(src_faces[0])
+        src_face = self.analyzer.best_face(src_faces)
+        src_emb = self.analyzer.embedding(src_face)
 
         # Detect target faces
         console.print("[dim]Detecting target face(s)…[/]")
@@ -160,8 +167,8 @@ class NexaPipeline:
             source_refs.append(
                 (
                     str(src_path),
-                    self.analyzer.embedding(src_faces[0]),
-                    self.analyzer.embedding(ref_faces[0]),
+                    self.analyzer.embedding(self.analyzer.best_face(src_faces)),
+                    self.analyzer.embedding(self.analyzer.best_face(ref_faces)),
                 )
             )
 
@@ -223,7 +230,8 @@ class NexaPipeline:
         src_faces = self.analyzer.detect(source_img)
         if not src_faces:
             raise RuntimeError(f"No face in source: {source_path}")
-        src_emb = self.analyzer.embedding(src_faces[0])
+        src_face = self.analyzer.best_face(src_faces)
+        src_emb = self.analyzer.embedding(src_face)
 
         target_path = Path(target_path)
         output_path = Path(output_path)

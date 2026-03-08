@@ -587,9 +587,9 @@ class FaceSwapper:
         full_image: np.ndarray,
         face,
         source_embedding: np.ndarray,
-        expand_ratio: float = 1.6,
+        expand_ratio: float = 1.35,
         mask_dilate: int = 2,
-        mask_blur: tuple[int, int] = (51, 51),
+        mask_blur: tuple[int, int] = (61, 61),
     ) -> np.ndarray:
         """Swap a single face in a full image.
 
@@ -650,6 +650,10 @@ class FaceSwapper:
             face, (crop_h, crop_w), (ex1, ey1), mask_dilate, mask_blur
         )
 
+        # Keep blend mostly inside the central face area (roop-like behavior).
+        interior = self._create_interior_ellipse_mask(face, (ex1, ey1), (crop_h, crop_w))
+        mask = np.clip(mask * interior, 0.0, 1.0)
+
         # Run diffusion swap
         swapped = self.swap(crop, source_embedding, mask)
 
@@ -685,21 +689,43 @@ class FaceSwapper:
         bx1, by1, bx2, by2 = bbox
         cx = (bx1 + bx2) * 0.5 - ox
         cy = (by1 + by2) * 0.5 - oy
-        rx = max(1.0, (bx2 - bx1) * 0.38)
-        ry = max(1.0, (by2 - by1) * 0.48)
+        rx = max(1.0, (bx2 - bx1) * 0.32)
+        ry = max(1.0, (by2 - by1) * 0.40)
 
         yy, xx = np.mgrid[0:crop_h, 0:crop_w]
         center_prior = 1.0 - (((xx - cx) / rx) ** 2 + ((yy - cy) / ry) ** 2)
         center_prior = np.clip(center_prior, 0.0, 1.0).astype(np.float32)
-        center_prior = cv2.GaussianBlur(center_prior, (31, 31), 0)
+        center_prior = cv2.GaussianBlur(center_prior, (41, 41), 0)
 
-        # Combine with the landmark mask:
-        # - higher blend at center (identity features)
-        # - softer blend at edges (better skin/hair/neck transitions)
-        adaptive = base_mask * (0.45 + 0.55 * center_prior)
+        # Combine with landmark mask with conservative edge blending.
+        adaptive = base_mask * (0.30 + 0.70 * center_prior)
         adaptive = np.clip(adaptive, 0.0, 1.0)
-        adaptive = cv2.GaussianBlur(adaptive, (31, 31), 0)
+        adaptive = cv2.GaussianBlur(adaptive, (41, 41), 0)
         return adaptive
+
+    @staticmethod
+    def _create_interior_ellipse_mask(
+        face,
+        crop_offset: tuple[int, int],
+        crop_shape: tuple[int, int],
+    ) -> np.ndarray:
+        """Conservative interior mask to avoid swapping jaw/neck/background."""
+        crop_h, crop_w = crop_shape
+        ox, oy = crop_offset
+
+        bbox = face.bbox.astype(int)
+        bx1, by1, bx2, by2 = bbox
+        cx = int((bx1 + bx2) * 0.5 - ox)
+        cy = int((by1 + by2) * 0.5 - oy)
+
+        rx = max(1, int((bx2 - bx1) * 0.36))
+        ry = max(1, int((by2 - by1) * 0.46))
+
+        interior = np.zeros((crop_h, crop_w), dtype=np.float32)
+        cv2.ellipse(interior, (cx, cy), (rx, ry), 0, 0, 360, 1.0, -1)
+        interior = cv2.GaussianBlur(interior, (31, 31), 0)
+        interior = np.clip(interior, 0.0, 1.0)
+        return interior
 
     @staticmethod
     def _create_face_mask(

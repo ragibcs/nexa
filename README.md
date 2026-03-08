@@ -51,7 +51,7 @@ Or use the CLI directly:
 ```bash
 %cd /content/nexa
 !pip install -e ".[gpu]"
-!nexa --source /content/source.jpg --target /content/target.jpg --output /content/output.jpg --steps 20 --gpu
+!nexa --source /content/source.jpg --target /content/target.jpg --output /content/output.jpg --gpu
 ```
 
 ## CLI Usage
@@ -66,9 +66,10 @@ nexa -m alice.jpg:person1.jpg -m bob.jpg:person2.jpg -t group.jpg -o out.jpg --g
 # Video processing
 nexa -s face.jpg -t video.mp4 -o output.mp4 --gpu --enhancer gfpgan
 
-# Custom parameters for better quality
+# Custom parameters for natural-looking swaps
 nexa -s face.jpg -t photo.jpg -o result.jpg --gpu \
-  --steps 25 --strength 0.6 --guidance-scale 6.0 --ip-scale 1.2
+  --steps 24 --strength 0.35 --guidance-scale 3.2 --ip-scale 0.8 \
+  --det-size 640 --det-score 0.45
 ```
 
 ### CLI Arguments
@@ -80,10 +81,12 @@ nexa -s face.jpg -t photo.jpg -o result.jpg --gpu \
 | `--output / -o` | *required* | Output file path |
 | `--map / -m` | None | Multi-face mapping `source.jpg:reference.jpg` (repeatable) |
 | `--model / -M` | `runwayml/stable-diffusion-v1-5` | HuggingFace SD1.5 model ID |
-| `--steps` | 20 | Diffusion inference steps (15-30 recommended) |
-| `--strength` | 0.65 | How much to change the init image (0=none, 1=full) |
-| `--guidance-scale` | 5.0 | Classifier-free guidance scale |
-| `--ip-scale` | 1.0 | IP-Adapter face identity strength |
+| `--steps` | 24 | Diffusion inference steps (20-35 recommended) |
+| `--strength` | 0.35 | How much to change the init image (lower = more realistic) |
+| `--guidance-scale` | 3.2 | Classifier-free guidance scale |
+| `--ip-scale` | 0.8 | IP-Adapter face identity strength |
+| `--det-size` | 640 | InsightFace detection size (512/640/768) |
+| `--det-score` | 0.45 | InsightFace detection score threshold |
 | `--enhancer / -e` | None | Face enhancer: `gfpgan` (or `codeformer`, currently using GFPGAN fallback) |
 | `--gpu` | False | Use CUDA acceleration |
 | `--threshold` | 0.6 | Cosine similarity threshold for multi-face reference matching |
@@ -96,11 +99,13 @@ from nexa.core.pipeline import NexaPipeline
 pipeline = NexaPipeline(
     model_id="runwayml/stable-diffusion-v1-5",
     device="cuda",
-    steps=20,
+    steps=24,
     enhancer_name="gfpgan",
-    ip_scale=1.0,
-    strength=0.65,
-    guidance_scale=5.0,
+    ip_scale=0.8,
+    strength=0.35,
+    guidance_scale=3.2,
+    det_size=640,
+    det_score=0.45,
 )
 
 # Single face swap
@@ -114,8 +119,8 @@ pipeline.process_video("source.jpg", "video.mp4", "output.mp4")
 
 ### Face Swap Pipeline (per frame)
 
-1. **Detect faces** in target image using InsightFace (`buffalo_l`)
-2. **Extract** 512-d ArcFace embeddings from source and target faces
+1. **Detect faces** in target image using InsightFace (`buffalo_l`) with configurable `det_size` and `det_score`
+2. **Extract** 512-d ArcFace embeddings from source and target faces (source selected via best detection score/area)
 3. For each face:
    - **Crop** expanded bounding box (1.6×) around target face
    - **Create soft mask** from landmark convex hull (dilated + blurred)
@@ -128,17 +133,19 @@ pipeline.process_video("source.jpg", "video.mp4", "output.mp4")
 ### Core Technology
 
 - **IP-Adapter FaceID** — custom implementation with `nn.Linear` attention processors (no deprecated `LoRALinearLayer`)
-- **DDIM Scheduler** — 20 steps, guidance scale 5.0, strength 0.65
+- **DDIM Scheduler** — default 24 steps, guidance scale 3.2, strength 0.35
 - **CPU Offload** — keeps peak VRAM under 8 GB on T4
 
 ## Quality Tuning
 
 | Parameter | Effect | Recommended |
 |-----------|--------|-------------|
-| `strength` | How much to change the init image | 0.5-0.7 |
-| `guidance_scale` | How strongly to follow the prompt | 4.0-7.0 |
-| `steps` | More steps = better quality, slower | 15-30 |
-| `ip_scale` | Face identity strength | 0.8-1.5 |
+| `strength` | How much to change the init image | 0.25-0.40 |
+| `guidance_scale` | How strongly to follow the prompt | 2.8-3.8 |
+| `steps` | More steps = better quality, slower | 20-30 |
+| `ip_scale` | Face identity strength | 0.7-1.0 |
+| `det_size` | Detector resolution for small/far faces | 640 (use 768 if needed) |
+| `det_score` | Detector confidence cutoff | 0.40-0.55 |
 
 ## Memory Budget (T4 — 15 GB VRAM)
 
@@ -170,6 +177,21 @@ pip install -e ".[gpu]"
 # FFmpeg (for video)
 sudo apt install ffmpeg
 ```
+
+## Roop Reference Environment (Research)
+
+If you want to compare behavior against a roop-style dependency stack, use the provided reference file:
+
+```bash
+pip install -r requirements-roop-reference.txt
+```
+
+This installs a CUDA 11.8 wheel index and roop-aligned package versions for research/testing.
+
+## Credits
+
+- [InsightFace](https://github.com/deepinsight/insightface) — face detection and ArcFace embeddings.
+- [roop](https://github.com/s0md3v/roop) — dependency profile referenced for compatibility research.
 
 ## License
 
